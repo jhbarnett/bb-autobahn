@@ -251,6 +251,147 @@ describe("autobahn backend", () => {
     dateNow.mockRestore();
   });
 
+  it("wakes a snoozed roadmap issue early when it raises its hand", async () => {
+    const now = Date.now();
+    const dateNow = vi.spyOn(Date, "now").mockReturnValue(now);
+    const sections = ["OPEN", "WIP", "R4R", "CLOSED"].map((name) => ({
+      id: `section-${name}`,
+      name,
+      createdAt: 1,
+      updatedAt: 1,
+    }));
+    const issue = {
+      repo: "acme/repo",
+      number: 42,
+      kind: "issue",
+      title: "Future work",
+      state: "open",
+      author: "agent",
+      labels: [] as string[],
+      assignees: [],
+      url: "https://github.com/acme/repo/issues/42",
+      body: "",
+      updatedAt: "2026-08-19T00:00:00Z",
+    };
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "autobahn",
+      agentSkillIds: ["autobahn-driver"],
+      sdk: {
+        plugins: {
+          callRpc: async ({ method }) => {
+            if (method === "listItems") return { items: [issue] };
+            if (method === "listLinks") return { links: {} };
+            if (method === "status") {
+              return {
+                ghOk: true,
+                ghError: null,
+                repos: [{ repo: "acme/repo", projectId: "project-1" }],
+                lastSyncedAt: "2026-08-19T00:00:00Z",
+              };
+            }
+            throw new Error("Unexpected GitHub RPC " + method);
+          },
+        },
+        threadSections: {
+          list: () => sections,
+          create: ({ name }) => ({
+            id: `section-${name}`,
+            name,
+            createdAt: 1,
+            updatedAt: 1,
+          }),
+        },
+        projects: { list: () => [] },
+        threads: { list: () => [] },
+      },
+    });
+    plugin(bb);
+
+    await harness.behavior.callRpc("snoozeRoadmapItem", {
+      itemKey: "issue:acme/repo#42",
+      wakeAt: now + 7 * 24 * 60 * 60 * 1_000,
+    });
+    const snoozed = await harness.behavior.callRpc("listBoard", {});
+    expect(snoozed.roadmapItems).toHaveLength(0);
+    expect(snoozed.snoozedCount).toBe(1);
+
+    issue.labels = ["blocked"];
+    dateNow.mockReturnValue(now + 31_000);
+    const woken = await harness.behavior.callRpc("listBoard", {});
+    expect(woken.roadmapItems).toHaveLength(1);
+    expect(woken.snoozedCount).toBe(0);
+    dateNow.mockRestore();
+  });
+
+  it("persists roadmap snoozes in the plugin database across reloads", async () => {
+    const now = Date.now();
+    const dateNow = vi.spyOn(Date, "now").mockReturnValue(now);
+    const sections = ["OPEN", "WIP", "R4R", "CLOSED"].map((name) => ({
+      id: `section-${name}`,
+      name,
+      createdAt: 1,
+      updatedAt: 1,
+    }));
+    const issue = {
+      repo: "acme/repo",
+      number: 42,
+      kind: "issue",
+      title: "Future work",
+      state: "open",
+      author: "agent",
+      labels: [],
+      assignees: [],
+      url: "https://github.com/acme/repo/issues/42",
+      body: "",
+      updatedAt: "2026-08-19T00:00:00Z",
+    };
+    const sdk = {
+      plugins: {
+        callRpc: async ({ method }: { method: string }) => {
+          if (method === "listItems") return { items: [issue] };
+          if (method === "listLinks") return { links: {} };
+          if (method === "status") {
+            return {
+              ghOk: true,
+              ghError: null,
+              repos: [{ repo: "acme/repo", projectId: "project-1" }],
+              lastSyncedAt: "2026-08-19T00:00:00Z",
+            };
+          }
+          throw new Error("Unexpected GitHub RPC " + method);
+        },
+      },
+      threadSections: {
+        list: () => sections,
+        create: ({ name }: { name: string }) => ({
+          id: `section-${name}`,
+          name,
+          createdAt: 1,
+          updatedAt: 1,
+        }),
+      },
+      projects: { list: () => [] },
+      threads: { list: () => [] },
+    };
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "autobahn",
+      agentSkillIds: ["autobahn-driver"],
+      sdk,
+    });
+    plugin(bb);
+
+    await harness.behavior.callRpc("snoozeRoadmapItem", {
+      itemKey: "issue:acme/repo#42",
+      wakeAt: now + 24 * 60 * 60 * 1_000,
+    });
+
+    const reloaded = await harness.lifecycle.reload(plugin);
+    const board = await reloaded.harness.behavior.callRpc("listBoard", {});
+    expect(board.roadmapItems).toHaveLength(0);
+    expect(board.snoozedCount).toBe(1);
+    dateNow.mockRestore();
+  });
+
   it("clears Closed cards without archiving and refreshes on archive", async () => {
     const sections = ["OPEN", "WIP", "R4R", "CLOSED"].map((name) => ({
       id: `section-${name}`,
@@ -665,6 +806,7 @@ describe("autobahn backend", () => {
       "autobahn_set_contract",
       "autobahn_run_plan",
       "autobahn_approve_plan",
+      "autobahn_gate_decision",
       "autobahn_run_verification",
       "autobahn_dispatch_ready",
       "autobahn_park_card",
@@ -984,6 +1126,700 @@ describe("autobahn backend", () => {
         projectId: "project-1",
       }),
     ).resolves.toContain("queue is healthy");
+  });
+
+  it("gates verified merged cards behind a human decision instead of auto-closing", async () => {
+    const sections = ["OPEN", "WIP", "R4R", "CLOSED"].map((name) => ({
+      id: `section-${name}`,
+      name,
+      createdAt: 1,
+      updatedAt: 1,
+    }));
+    const row = {
+      id: "thread-1",
+      projectId: "project-1",
+      environmentId: "environment-1",
+      providerId: "codex",
+      title: "Gated card",
+      titleFallback: null,
+      sectionId: "section-OPEN",
+      status: "idle",
+      hasPendingInteraction: false,
+      environmentBranchName: "feature/gate",
+      updatedAt: Date.now(),
+    };
+    let prState: string | null = null;
+    let spawned = 0;
+    const passReport = JSON.stringify({
+      verdict: "PASS",
+      summary: "No findings.",
+      findings: [],
+    });
+    const update = vi.fn(({ sectionId }) => {
+      if (sectionId) row.sectionId = sectionId;
+      return row;
+    });
+    const send = vi.fn(() => ({ ok: true }));
+    const stop = vi.fn(() => ({ ok: true }));
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "autobahn",
+      agentSkillIds: ["autobahn-driver"],
+      sdk: {
+        threadSections: {
+          list: () => sections,
+          create: ({ name }) => ({
+            id: `section-${name}`,
+            name,
+            createdAt: 1,
+            updatedAt: 1,
+          }),
+        },
+        projects: {
+          list: () => [
+            {
+              id: "project-1",
+              name: "Agentbox",
+              kind: "standard",
+              gitRemoteUrl: null,
+              createdAt: 1,
+              updatedAt: 1,
+              sources: [],
+            },
+          ],
+        },
+        environments: {
+          get: () => ({
+            hostId: "host-1",
+            isGitRepo: true,
+            branchName: "feature/gate",
+          }),
+          status: async () => ({ outcome: "unavailable" }),
+          pullRequest: async () =>
+            prState === null
+              ? { outcome: "absent" }
+              : {
+                  outcome: "available",
+                  pullRequest: {
+                    number: 9,
+                    title: "Gated card",
+                    state: prState,
+                    url: "https://github.com/acme/repo/pull/9",
+                    attention: null,
+                    checks: { state: "passing" },
+                  },
+                },
+        },
+        threads: {
+          list: (args) =>
+            args?.sectionId && row.sectionId !== args.sectionId ? [] : [row],
+          get: ({ threadId }) => ({
+            ...(threadId === "thread-1"
+              ? row
+              : { id: threadId, projectId: "project-1" }),
+            archivedAt: null,
+            deletedAt: null,
+          }),
+          spawn: () => ({ id: `child-${++spawned}` }),
+          wait: async () => ({ ok: true }),
+          update,
+          send,
+          stop,
+          archive: async () => ({ ok: true }),
+          defaultExecutionOptions: async () => ({
+            model: "gpt-5.6",
+            reasoningLevel: "high",
+            permissionMode: "auto",
+            serviceTier: "default",
+            source: "client/turn/start",
+          }),
+          timeline: async () => ({ rows: [] }),
+          output: async ({ threadId }) =>
+            typeof threadId === "string" && threadId.startsWith("child-")
+              ? { output: passReport }
+              : { output: "Ready." },
+          interactions: { list: async () => [] },
+        },
+      },
+    });
+    plugin(bb);
+
+    await harness.behavior.callAgentTool("autobahn_set_contract", {
+      threadId: "thread-1",
+      riskClass: "low",
+      priority: 1,
+      blockedBy: [],
+      requiresHumanApproval: false,
+      contract: {
+        objective: "Ship the gated feature",
+        scope: ["server.ts"],
+        outOfScope: ["docs"],
+        expectedFiles: ["server.ts"],
+        acceptanceCriteria: ["gate decisions are explicit"],
+        verificationCommands: ["npm test"],
+      },
+    });
+    await expect(
+      harness.behavior.callAgentTool(
+        "autobahn_dispatch_ready",
+        { projectId: "project-1" },
+        { threadId: "driver-thread" },
+      ),
+    ).resolves.toContain("Dispatched 1");
+    await harness.behavior.callAgentTool(
+      "autobahn_report_exit",
+      {
+        phase: "build",
+        status: "DONE",
+        summary: "Implemented.",
+        nextAction: "Run verification",
+        concerns: [],
+        evidence: [{ label: "Unit tests" }],
+      },
+      { threadId: "thread-1" },
+    );
+    await expect(
+      harness.behavior.callAgentTool("autobahn_run_verification", {
+        threadId: "thread-1",
+        objective: "Ship the gated feature",
+      }),
+    ).resolves.toContain("Verification DONE");
+    expect(row.sectionId).toBe("section-R4R");
+
+    prState = "merged";
+    const board = (await harness.behavior.callRpc("listBoard", {})) as {
+      lanes: Array<{ status: string; cards: Array<{ id: string }> }>;
+    };
+    expect(
+      board.lanes.find((lane) => lane.status === "R4R")?.cards.map(
+        (card) => card.id,
+      ),
+    ).toEqual(["thread-1"]);
+    await vi.waitFor(() => {
+      expect(harness.inspection.pendingInteractions).toHaveLength(1);
+    });
+    const raised = harness.inspection.pendingInteractions[0]!;
+    expect(raised.rendererId).toBe("gate-decision");
+    expect(raised.threadId).toBe("thread-1");
+    expect(raised.payload).toMatchObject({
+      cardThreadId: "thread-1",
+      cardTitle: "Gated card",
+      objective: "Ship the gated feature",
+    });
+    expect(JSON.stringify(raised.payload).length).toBeLessThan(64 * 1024);
+    await expect(
+      harness.behavior.callAgentTool("autobahn_witness", {
+        projectId: "project-1",
+      }),
+    ).resolves.toContain(
+      "thread-1: gate-ready — human egress decision requested",
+    );
+    expect(harness.inspection.pendingInteractions).toHaveLength(1);
+
+    harness.behavior.submitInteraction(raised.id, {
+      decision: "snooze",
+      note: "Later",
+      snoozeUntilEpochMs: Date.now() + 60 * 60 * 1_000,
+    });
+    await vi.waitFor(async () => {
+      const snoozed = (await harness.behavior.callRpc("listBoard", {})) as {
+        lanes: Array<{
+          status: string;
+          cards: Array<{ workflow: { parkedWake: { kind: string } | null } }>;
+        }>;
+      };
+      expect(
+        snoozed.lanes.find((lane) => lane.status === "R4R")?.cards[0]?.workflow
+          .parkedWake,
+      ).toMatchObject({ kind: "timer" });
+    });
+    expect(row.sectionId).toBe("section-R4R");
+    expect(harness.inspection.pendingInteractions).toHaveLength(0);
+
+    await harness.behavior.callAgentTool("autobahn_wake_card", {
+      threadId: "thread-1",
+      reason: "Revisit the gate",
+      nextAction: "Decide the gate",
+    });
+    const decision = harness.behavior.callAgentTool(
+      "autobahn_gate_decision",
+      { threadId: "thread-1", reason: "PR merged with evidence" },
+      { threadId: "driver-thread" },
+    );
+    await vi.waitFor(() => {
+      expect(harness.inspection.pendingInteractions).toHaveLength(1);
+    });
+    harness.behavior.submitInteraction(
+      harness.inspection.pendingInteractions[0]!.id,
+      { decision: "send-back", note: "Missing changelog" },
+    );
+    await expect(decision).resolves.toContain("back to WIP");
+    expect(row.sectionId).toBe("section-WIP");
+    const sentBack = (await harness.behavior.callRpc("listBoard", {})) as {
+      lanes: Array<{
+        status: string;
+        cards: Array<{
+          workflow: { phase: string; concerns: string[]; nextAction: string | null };
+        }>;
+      }>;
+    };
+    const sentBackCard = sentBack.lanes.find(
+      (lane) => lane.status === "WIP",
+    )?.cards[0];
+    expect(sentBackCard?.workflow.phase).toBe("build");
+    expect(sentBackCard?.workflow.concerns).toContain("Missing changelog");
+    expect(sentBackCard?.workflow.nextAction).toContain("Missing changelog");
+    expect(harness.inspection.pendingInteractions).toHaveLength(0);
+
+    await harness.behavior.callAgentTool(
+      "autobahn_report_exit",
+      {
+        phase: "build",
+        status: "DONE",
+        summary: "Changelog added.",
+        nextAction: "Run verification",
+        concerns: [],
+        evidence: [{ label: "Changelog" }],
+      },
+      { threadId: "thread-1" },
+    );
+    await expect(
+      harness.behavior.callAgentTool("autobahn_run_verification", {
+        threadId: "thread-1",
+        objective: "Ship the gated feature",
+      }),
+    ).resolves.toContain("Verification DONE");
+    expect(row.sectionId).toBe("section-R4R");
+
+    await harness.behavior.callRpc("listBoard", {});
+    await vi.waitFor(() => {
+      expect(harness.inspection.pendingInteractions).toHaveLength(1);
+    });
+    harness.behavior.submitInteraction(
+      harness.inspection.pendingInteractions[0]!.id,
+      { decision: "approve", note: "Ship it" },
+    );
+    await vi.waitFor(() => {
+      expect(row.sectionId).toBe("section-CLOSED");
+    });
+    const closed = (await harness.behavior.callRpc("listBoard", {})) as {
+      lanes: Array<{
+        status: string;
+        cards: Array<{
+          workflow: { phase: string; exitStatus: string | null };
+        }>;
+      }>;
+    };
+    const closedCard = closed.lanes.find(
+      (lane) => lane.status === "CLOSED",
+    )?.cards[0];
+    expect(closedCard?.workflow.phase).toBe("complete");
+    expect(closedCard?.workflow.exitStatus).toBe("DONE");
+  });
+
+  it("runs witness checks on lifecycle events and auto-clears archived CLOSED cards", async () => {
+    const sections = ["OPEN", "WIP", "R4R", "CLOSED"].map((name) => ({
+      id: `section-${name}`,
+      name,
+      createdAt: 1,
+      updatedAt: 1,
+    }));
+    const failedRow = {
+      id: "thread-err",
+      projectId: "project-1",
+      environmentId: null,
+      providerId: "codex",
+      title: "Failing work",
+      titleFallback: null,
+      sectionId: "section-WIP",
+      status: "error",
+      hasPendingInteraction: false,
+      environmentBranchName: null,
+      updatedAt: Date.now(),
+    };
+    const closedRow = {
+      id: "thread-done",
+      projectId: "project-1",
+      environmentId: null,
+      providerId: "codex",
+      title: "Completed work",
+      titleFallback: null,
+      sectionId: "section-CLOSED",
+      status: "idle",
+      hasPendingInteraction: false,
+      environmentBranchName: null,
+      updatedAt: Date.now(),
+    };
+    let closedArchivedAt: number | null = null;
+    const send = vi.fn(() => ({ ok: true }));
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "autobahn",
+      agentSkillIds: ["autobahn-driver"],
+      sdk: {
+        threadSections: {
+          list: () => sections,
+          create: ({ name }) => ({
+            id: `section-${name}`,
+            name,
+            createdAt: 1,
+            updatedAt: 1,
+          }),
+        },
+        projects: {
+          list: () => [
+            {
+              id: "project-1",
+              name: "Agentbox",
+              kind: "standard",
+              gitRemoteUrl: null,
+              createdAt: 1,
+              updatedAt: 1,
+              sources: [],
+            },
+          ],
+        },
+        threads: {
+          list: () => [failedRow, closedRow],
+          get: ({ threadId }) => {
+            if (threadId === "thread-err") {
+              return { ...failedRow, archivedAt: null, deletedAt: null };
+            }
+            if (threadId === "thread-done") {
+              return {
+                ...closedRow,
+                archivedAt: closedArchivedAt,
+                deletedAt: null,
+              };
+            }
+            return {
+              id: threadId,
+              projectId: "project-1",
+              archivedAt: null,
+              deletedAt: null,
+            };
+          },
+          spawn: () => ({ id: "driver-thread" }),
+          send,
+          defaultExecutionOptions: async () => ({
+            model: "gpt-5.6",
+            reasoningLevel: "high",
+            permissionMode: "auto",
+            serviceTier: "default",
+            source: "client/turn/start",
+          }),
+          timeline: async () => ({ rows: [] }),
+          output: async () => ({ output: "Working." }),
+        },
+      },
+    });
+    plugin(bb);
+
+    await expect(
+      harness.behavior.callRpc("getDriver"),
+    ).resolves.toEqual({ threadId: "driver-thread" });
+
+    await harness.behavior.emitThreadEvent("thread.failed", {
+      thread: makeThreadResponse({ id: "thread-err" }),
+    });
+    expect(send).toHaveBeenCalledTimes(1);
+    const notification = send.mock.calls[0]![0] as {
+      threadId: string;
+      input: Array<{ text: string }>;
+    };
+    expect(notification.threadId).toBe("driver-thread");
+    expect(notification.input[0]!.text).toContain(
+      "thread-err: runtime is in error",
+    );
+    expect(notification.input[0]!.text).not.toContain("thread-done");
+
+    await harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: "thread-err" }),
+    });
+    expect(send).toHaveBeenCalledTimes(1);
+
+    const before = await harness.behavior.callRpc("listBoard", {});
+    expect(
+      before.lanes
+        .find((lane) => lane.status === "CLOSED")
+        ?.cards.map((card) => card.id),
+    ).toEqual(["thread-done"]);
+    closedArchivedAt = Date.now();
+    await harness.behavior.emitThreadEvent("thread.archived", {
+      thread: makeThreadResponse({ id: "thread-done" }),
+    });
+    expect(
+      harness.inspection.realtimeSignals.some(
+        (signal) =>
+          signal.channel === "board-changed" &&
+          (signal.payload as { event?: string }).event === "closed.auto-cleared",
+      ),
+    ).toBe(true);
+    const after = await harness.behavior.callRpc("listBoard", {});
+    expect(
+      after.lanes.find((lane) => lane.status === "CLOSED")?.cards,
+    ).toHaveLength(0);
+  });
+
+  it("spawns hidden plan workers and cleans them up on success and failure", async () => {
+    const sections = ["OPEN", "WIP", "R4R", "CLOSED"].map((name) => ({
+      id: `section-${name}`,
+      name,
+      createdAt: 1,
+      updatedAt: 1,
+    }));
+    const row = {
+      id: "thread-1",
+      projectId: "project-1",
+      environmentId: "environment-1",
+      providerId: "codex",
+      title: "Policy-driven card",
+      titleFallback: null,
+      sectionId: "section-WIP",
+      status: "idle",
+      hasPendingInteraction: false,
+      environmentBranchName: "feature/policy",
+      updatedAt: Date.now(),
+    };
+    const plannerJson = JSON.stringify({
+      summary: "Ship hidden worker cleanup",
+      scope: ["server.ts"],
+      outOfScope: ["docs"],
+      implementationSteps: ["Edit server.ts"],
+      acceptanceCriteria: ["typecheck and tests pass"],
+      verification: ["npm test"],
+      risks: ["low"],
+      openQuestions: [],
+    });
+    const reviewJson = JSON.stringify({
+      verdict: "ACCEPT",
+      summary: "The plan is sound.",
+      concerns: [],
+      requiredChanges: [],
+    });
+    let spawned = 0;
+    let failChildOutput = false;
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "autobahn",
+      agentSkillIds: ["autobahn-driver"],
+      sdk: {
+        threadSections: {
+          list: () => sections,
+          create: ({ name }) => ({
+            id: `section-${name}`,
+            name,
+            createdAt: 1,
+            updatedAt: 1,
+          }),
+        },
+        environments: {
+          get: () => ({
+            hostId: "host-1",
+            isGitRepo: true,
+            branchName: "feature/policy",
+          }),
+        },
+        threads: {
+          get: () => ({ ...row, archivedAt: null, deletedAt: null }),
+          spawn: () => ({ id: `child-${++spawned}` }),
+          wait: async () => ({ ok: true }),
+          output: async ({ threadId }) => {
+            if (failChildOutput) throw new Error("child output unavailable");
+            return {
+              output: threadId === "child-1" ? plannerJson : reviewJson,
+            };
+          },
+          archive: async () => ({ ok: true }),
+          stop: async () => ({ ok: true }),
+          send: async () => ({ ok: true }),
+        },
+      },
+    });
+    plugin(bb);
+
+    await expect(
+      harness.behavior.callAgentTool("autobahn_run_plan", {
+        threadId: "thread-1",
+        objective: "Ship hidden worker cleanup",
+      }),
+    ).resolves.toContain("Plan accepted");
+
+    const spawns = harness.inspection.sdk.callsTo("threads.spawn");
+    expect(spawns).toHaveLength(2);
+    for (const [args] of spawns as Array<[Record<string, unknown>]>) {
+      expect(args).toMatchObject({
+        projectId: "project-1",
+        parentThreadId: "thread-1",
+        visibility: "hidden",
+        environment: {
+          type: "host",
+          hostId: "host-1",
+          workspace: {
+            type: "managed-worktree",
+            baseBranch: { kind: "named", name: "feature/policy" },
+          },
+        },
+      });
+    }
+    expect(
+      harness.inspection.sdk.callsTo("threads.archive").map(([args]) => args),
+    ).toEqual([{ threadId: "child-1" }, { threadId: "child-2" }]);
+    expect(
+      harness.inspection.sdk.callsTo("threads.stop").map(([args]) => args),
+    ).toEqual([{ threadId: "child-1" }, { threadId: "child-2" }]);
+
+    failChildOutput = true;
+    await expect(
+      harness.behavior.callAgentTool("autobahn_run_plan", {
+        threadId: "thread-1",
+        objective: "Ship hidden worker cleanup",
+      }),
+    ).rejects.toThrow("child output unavailable");
+    expect(
+      harness.inspection.sdk.callsTo("threads.archive").map(([args]) => args),
+    ).toContainEqual({ threadId: "child-3" });
+    expect(
+      harness.inspection.sdk.callsTo("threads.stop").map(([args]) => args),
+    ).toContainEqual({ threadId: "child-3" });
+  });
+
+  it("runs witness probes as hidden children with cleanup on every path", async () => {
+    const sections = ["OPEN", "WIP", "R4R", "CLOSED"].map((name) => ({
+      id: `section-${name}`,
+      name,
+      createdAt: 1,
+      updatedAt: 1,
+    }));
+    const rows = ["thread-err", "thread-err2"].map((id) => ({
+      id,
+      projectId: "project-1",
+      environmentId: null,
+      providerId: "codex",
+      title: `Failing work ${id}`,
+      titleFallback: null,
+      sectionId: "section-WIP",
+      status: "error",
+      hasPendingInteraction: false,
+      environmentBranchName: null,
+      updatedAt: Date.now(),
+    }));
+    let probeCount = 0;
+    let probeShouldFail = false;
+    const send = vi.fn(() => ({ ok: true }));
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "autobahn",
+      agentSkillIds: ["autobahn-driver"],
+      sdk: {
+        threadSections: {
+          list: () => sections,
+          create: ({ name }) => ({
+            id: `section-${name}`,
+            name,
+            createdAt: 1,
+            updatedAt: 1,
+          }),
+        },
+        projects: {
+          list: () => [
+            {
+              id: "project-1",
+              name: "Agentbox",
+              kind: "standard",
+              gitRemoteUrl: null,
+              createdAt: 1,
+              updatedAt: 1,
+              sources: [],
+            },
+          ],
+        },
+        threads: {
+          list: () => rows,
+          get: ({ threadId }) => {
+            const found = rows.find((candidate) => candidate.id === threadId);
+            return {
+              ...(found ?? { id: threadId, projectId: "project-1" }),
+              archivedAt: null,
+              deletedAt: null,
+            };
+          },
+          spawn: ({ title }) =>
+            title === "Autobahn witness probe"
+              ? { id: `probe-${++probeCount}` }
+              : { id: "driver-thread" },
+          wait: async () => ({ ok: true }),
+          output: async ({ threadId }) => {
+            if (typeof threadId === "string" && threadId.startsWith("probe-")) {
+              if (probeShouldFail) throw new Error("probe crashed");
+              return { output: "Restart the failed runtime." };
+            }
+            return { output: "Working." };
+          },
+          archive: async () => ({ ok: true }),
+          stop: async () => ({ ok: true }),
+          send,
+          defaultExecutionOptions: async () => ({
+            model: "gpt-5.6",
+            reasoningLevel: "high",
+            permissionMode: "auto",
+            serviceTier: "default",
+            source: "client/turn/start",
+          }),
+          timeline: async () => ({ rows: [] }),
+        },
+      },
+    });
+    plugin(bb);
+    await harness.behavior.callRpc("getDriver");
+
+    await harness.behavior.emitThreadEvent("thread.failed", {
+      thread: makeThreadResponse({ id: "thread-err" }),
+    });
+    const probeSpawns = harness.inspection.sdk
+      .callsTo("threads.spawn")
+      .map(([args]) => args as Record<string, unknown>)
+      .filter((args) => args.title === "Autobahn witness probe");
+    expect(probeSpawns).toHaveLength(1);
+    expect(probeSpawns[0]).toMatchObject({
+      projectId: "project-1",
+      parentThreadId: "thread-err",
+      visibility: "hidden",
+      environment: { type: "project-default" },
+    });
+    expect(
+      harness.inspection.sdk.callsTo("threads.archive").map(([args]) => args),
+    ).toContainEqual({ threadId: "probe-1" });
+    expect(
+      harness.inspection.sdk.callsTo("threads.stop").map(([args]) => args),
+    ).toContainEqual({ threadId: "probe-1" });
+    expect(send).toHaveBeenCalledTimes(1);
+    const success = send.mock.calls[0]![0] as {
+      input: Array<{ text: string }>;
+    };
+    expect(success.input[0]!.text).toContain(
+      "thread-err: runtime is in error",
+    );
+    expect(success.input[0]!.text).toContain(
+      "Witness probe recommendation:\nRestart the failed runtime.",
+    );
+
+    probeShouldFail = true;
+    await harness.behavior.emitThreadEvent("thread.failed", {
+      thread: makeThreadResponse({ id: "thread-err2" }),
+    });
+    expect(
+      harness.inspection.sdk.callsTo("threads.archive").map(([args]) => args),
+    ).toContainEqual({ threadId: "probe-2" });
+    expect(
+      harness.inspection.sdk.callsTo("threads.stop").map(([args]) => args),
+    ).toContainEqual({ threadId: "probe-2" });
+    expect(send).toHaveBeenCalledTimes(2);
+    const fallback = send.mock.calls[1]![0] as {
+      input: Array<{ text: string }>;
+    };
+    expect(fallback.input[0]!.text).toContain(
+      "thread-err2: runtime is in error",
+    );
+    expect(fallback.input[0]!.text).toContain(
+      "Recommend action; do not stop work automatically.",
+    );
   });
 
   it("selects only skill ids shipped by the manifest's skills directory", async () => {

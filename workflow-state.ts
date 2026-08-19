@@ -36,6 +36,11 @@ export const WORKFLOW_STATE_MIGRATIONS = [
   `ALTER TABLE card_workflow_state ADD COLUMN status_override TEXT`,
   `ALTER TABLE card_workflow_state ADD COLUMN status_override_reason TEXT`,
   `ALTER TABLE card_workflow_state ADD COLUMN status_override_at INTEGER`,
+  `CREATE TABLE IF NOT EXISTS roadmap_snoozes (
+    item_key TEXT PRIMARY KEY,
+    snoozed_until INTEGER NOT NULL,
+    snoozed_at INTEGER NOT NULL
+  )`,
 ] as const;
 
 export const WORKFLOW_PHASES = [
@@ -168,6 +173,19 @@ export interface CardWorkflowEvent {
   type: string;
   payload: JsonObject;
   createdAt: number;
+}
+
+export interface RoadmapSnooze {
+  itemKey: string;
+  snoozedUntil: number;
+  snoozedAt: number;
+}
+
+export interface RoadmapSnoozeStore {
+  get(itemKey: string): RoadmapSnooze | null;
+  list(): RoadmapSnooze[];
+  snooze(input: RoadmapSnooze): RoadmapSnooze;
+  wake(itemKey: string): boolean;
 }
 
 export interface CardWorkflowStore {
@@ -736,5 +754,63 @@ export function createWorkflowStateStore(
         ? allEvents.all()
         : threadEvents.all(requireText(threadId, "threadId"))
       ).map(fromEventRow),
+  };
+}
+
+interface RoadmapSnoozeRow {
+  item_key: string;
+  snoozed_until: number;
+  snoozed_at: number;
+}
+
+export function createRoadmapSnoozeStore(
+  db: Database.Database,
+): RoadmapSnoozeStore {
+  const selectSnooze = db.prepare<[string], RoadmapSnoozeRow>(
+    `SELECT * FROM roadmap_snoozes WHERE item_key = ?`,
+  );
+  const listSnoozes = db.prepare<[], RoadmapSnoozeRow>(
+    `SELECT * FROM roadmap_snoozes ORDER BY snoozed_until ASC, item_key ASC`,
+  );
+  const writeSnooze = db.prepare<RoadmapSnoozeRow>(
+    `INSERT INTO roadmap_snoozes (item_key, snoozed_until, snoozed_at)
+      VALUES (@item_key, @snoozed_until, @snoozed_at)
+      ON CONFLICT(item_key) DO UPDATE SET
+        snoozed_until = excluded.snoozed_until,
+        snoozed_at = excluded.snoozed_at`,
+  );
+  const deleteSnooze = db.prepare<[string]>(
+    `DELETE FROM roadmap_snoozes WHERE item_key = ?`,
+  );
+
+  function fromRow(row: RoadmapSnoozeRow): RoadmapSnooze {
+    return {
+      itemKey: row.item_key,
+      snoozedUntil: row.snoozed_until,
+      snoozedAt: row.snoozed_at,
+    };
+  }
+
+  return {
+    get: (itemKey) => {
+      const row = selectSnooze.get(requireText(itemKey, "itemKey"));
+      return row ? fromRow(row) : null;
+    },
+    list: () => listSnoozes.all().map(fromRow),
+    snooze: (input) => {
+      const snooze: RoadmapSnooze = {
+        itemKey: requireText(input.itemKey, "itemKey"),
+        snoozedUntil: requireTimestamp(input.snoozedUntil, "snoozedUntil"),
+        snoozedAt: requireTimestamp(input.snoozedAt, "snoozedAt"),
+      };
+      writeSnooze.run({
+        item_key: snooze.itemKey,
+        snoozed_until: snooze.snoozedUntil,
+        snoozed_at: snooze.snoozedAt,
+      });
+      return snooze;
+    },
+    wake: (itemKey) =>
+      deleteSnooze.run(requireText(itemKey, "itemKey")).changes > 0,
   };
 }
