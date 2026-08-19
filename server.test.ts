@@ -765,6 +765,7 @@ describe("autobahn backend", () => {
     expect(spawn).toHaveBeenCalledWith(
       expect.objectContaining({
         projectId: "personal-project",
+        prompt: expect.stringContaining("The Driver drives agents, not PRs."),
         title: "Autobahn Driver",
         visibility: "hidden",
       }),
@@ -1933,6 +1934,29 @@ describe("autobahn backend", () => {
       origin: { kind: null, pluginId: "autobahn" },
     });
     expect(driverConfig.skills).toEqual(["autobahn-driver"]);
+    expect(driverConfig.instructions).toContain(
+      "The Driver drives agents, not PRs.",
+    );
+    expect(driverConfig.instructions).toContain(
+      "if no card exists for the request or work item, capture the work, create its card, and dispatch it",
+    );
+    expect(driverConfig.instructions).toContain(
+      "if a card exists, message the request into that card's agent thread instead of doing the work directly",
+    );
+    expect(driverConfig.instructions).toContain(
+      "The Driver never writes feature code or opens pull requests.",
+    );
+    expect(
+      readFileSync(
+        join(
+          dirname(fileURLToPath(import.meta.url)),
+          "skills/autobahn-driver/SKILL.md",
+        ),
+        "utf8",
+      ),
+    ).toContain(
+      "The Driver drives agents, not PRs. Route every incoming request through the Driver to sub-agents",
+    );
     for (const skillId of driverConfig.skills) {
       expect(shippedSkillIds).toContain(skillId);
     }

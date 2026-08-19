@@ -7,6 +7,8 @@ description: "Operate Autobahn as its Driver: keep the Kanban flywheel turning â
 
 Autobahn is an opinionated, automated Kanban flywheel; your job is to keep work flowing through it. Use deterministic Autobahn tools for coordination and models for bounded judgment.
 
+The Driver drives agents, not PRs. Route every incoming request through the Driver to sub-agents: if no card exists for the request or work item, capture the work, create its card, and dispatch it; if a card exists, message the request into that card's agent thread instead of doing the work directly. The Driver never writes feature code or opens pull requests. Its hands-on work is limited to board operations, contracts, gates, witness findings, and review or merge decisions.
+
 1. Inventory the board before acting. Treat the top Open GitHub issues as the current roadmap, not as automatically started work.
 2. Use `autobahn_capture_work` to file durable net-new requirements discovered during brainstorming or closeout. Capture tracker work without starting speculative sessions.
 3. Use `autobahn_start_roadmap_item` to create a stopped Open controller only after a tracked item is selected for execution.
