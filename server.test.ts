@@ -141,6 +141,167 @@ describe("autobahn backend", () => {
     ).rejects.toThrow("completed fresh-context verification panel");
   });
 
+  it("captures tracker work without starting a session and reuses duplicates", async () => {
+    const items: Array<Record<string, unknown>> = [];
+    let nextNumber = 73;
+    let failLabels = false;
+    const callRpc = vi.fn(async ({ pluginId, method, input }) => {
+      expect(pluginId).toBe("github");
+      if (method === "listItems") return { items };
+      if (method === "listLinks") return { links: {} };
+      if (method === "status") {
+        return {
+          ghOk: true,
+          ghError: null,
+          repos: [{ repo: "acme/repo", projectId: "project-1" }],
+          lastSyncedAt: "2026-08-19T00:00:00Z",
+        };
+      }
+      if (method === "createIssue") {
+        const number = nextNumber++;
+        const url = "https://github.com/acme/repo/issues/" + number;
+        items.push({
+          repo: "acme/repo",
+          number,
+          kind: "issue",
+          title: input.title,
+          state: "open",
+          author: "agent",
+          labels: [],
+          assignees: [],
+          url,
+          body: input.body,
+          updatedAt: "2026-08-19T00:00:00Z",
+        });
+        return { number, url };
+      }
+      if (method === "setLabels") {
+        if (failLabels) throw new Error("label permission denied");
+        return { ok: true, labels: input.labels };
+      }
+      if (method === "refresh") return { repos: 1, items: items.length };
+      throw new Error("Unexpected GitHub RPC " + method);
+    });
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "autobahn",
+      agentSkillIds: ["autobahn-driver"],
+      sdk: {
+        plugins: { callRpc },
+        threads: {
+          get: () => ({
+            id: "source-thread",
+            projectId: "project-1",
+            title: "Close out implementation",
+            titleFallback: null,
+          }),
+        },
+      },
+    });
+    plugin(bb);
+
+    const input = {
+      title: "Add Linear capture adapter",
+      description: "Support a second issue tracker without changing the agent contract.",
+      acceptanceCriteria: ["Linear items appear in the Open roadmap"],
+      labels: ["roadmap", "integration"],
+    };
+    await expect(
+      harness.behavior.callAgentTool(
+        "autobahn_capture_work",
+        input,
+        { threadId: "source-thread", projectId: "project-1" },
+      ),
+    ).resolves.toContain(
+      "Created github work item acme/repo#73: https://github.com/acme/repo/issues/73",
+    );
+    const createCall = callRpc.mock.calls.find(
+      ([args]) => args.method === "createIssue",
+    )?.[0];
+    expect(createCall?.input).toMatchObject({
+      repo: "acme/repo",
+      title: input.title,
+    });
+    expect(createCall?.input.body).toContain("## Acceptance criteria");
+    expect(createCall?.input.body).toContain(
+      "Linear items appear in the Open roadmap",
+    );
+    expect(createCall?.input.body).toContain("source-thread");
+    expect(callRpc).toHaveBeenCalledWith(
+      expect.objectContaining({
+        method: "setLabels",
+        input: {
+          repo: "acme/repo",
+          number: 73,
+          labels: ["roadmap", "integration"],
+        },
+      }),
+    );
+    expect(harness.inspection.sdk.callsTo("threads.spawn")).toEqual([]);
+    await expect(
+      harness.behavior.callAgentTool(
+        "autobahn_capture_work",
+        { ...input, projectId: "other-project" },
+        { threadId: "source-thread", projectId: "project-1" },
+      ),
+    ).rejects.toThrow(
+      "Controller agents may capture work only in their current project",
+    );
+
+    await expect(
+      harness.behavior.callAgentTool(
+        "autobahn_capture_work",
+        { ...input, title: "  add   linear capture ADAPTER " },
+        { threadId: "source-thread", projectId: "project-1" },
+      ),
+    ).resolves.toContain("Reused existing github work item acme/repo#73");
+    expect(
+      callRpc.mock.calls.filter(([args]) => args.method === "createIssue"),
+    ).toHaveLength(1);
+
+    failLabels = true;
+    await expect(
+      harness.behavior.callAgentTool(
+        "autobahn_capture_work",
+        {
+          ...input,
+          title: "Capture tracker projects",
+          labels: ["epic"],
+        },
+        { threadId: "source-thread", projectId: "project-1" },
+      ),
+    ).resolves.toContain("labels could not be applied");
+
+    const controllerConfig = await harness.behavior.resolveAgentConfiguration({
+      thread: {
+        id: "source-thread",
+        title: "Close out implementation",
+        parentThreadId: null,
+        sourceThreadId: null,
+      },
+      project: {
+        id: "project-1",
+        kind: "standard",
+        name: "Agentbox",
+        gitRemoteUrl: null,
+      },
+      environment: {
+        id: "environment-1",
+        name: null,
+        path: "/workspace",
+        workspaceProvisionType: "managed-worktree",
+        branchName: "feature/test",
+      },
+      host: { id: "host-1", name: "Local" },
+      provider: { id: "codex", model: "gpt-5.6" },
+      origin: { kind: null, pluginId: null },
+    });
+    expect(controllerConfig.tools.map((tool) => tool.name)).toEqual([
+      "autobahn_move_thread",
+      "autobahn_capture_work",
+      "autobahn_report_exit",
+    ]);
+  });
+
   it("persists a hidden Driver with scoped session-management tools", async () => {
     const sections = ["OPEN", "WIP", "R4R", "CLOSED"].map((name) => ({
       id: `section-${name}`,
@@ -251,6 +412,7 @@ describe("autobahn backend", () => {
     });
     expect(driverConfig.tools.map((tool) => tool.name)).toEqual([
       "autobahn_list_cards",
+      "autobahn_capture_work",
       "autobahn_create_session",
       "autobahn_assign_session",
       "autobahn_move_card",

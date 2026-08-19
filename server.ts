@@ -9,6 +9,7 @@ import {
   WORKFLOW_STATE_MIGRATIONS,
   createWorkflowStateStore,
   type CardWorkflowState,
+  type JsonObject,
   type PlanContract,
   type WorkflowEvidence,
 } from "./workflow-state";
@@ -152,6 +153,18 @@ const githubStatusOutputSchema = z
 const githubStartWorkOutputSchema = z
   .object({ threadId: z.string().min(1) })
   .strict();
+const githubCreateIssueOutputSchema = z
+  .object({ number: z.number().int().positive().nullable(), url: z.string() })
+  .strict();
+const githubSetLabelsOutputSchema = z
+  .object({ ok: z.literal(true), labels: z.array(z.string().min(1)) })
+  .strict();
+const githubRefreshOutputSchema = z
+  .object({
+    repos: z.number().int().nonnegative(),
+    items: z.number().int().nonnegative(),
+  })
+  .strict();
 
 const roadmapItemSchema = z.object({
   id: z.string(),
@@ -254,6 +267,21 @@ interface MoveOptions {
   setOverride?: boolean;
   bypassWorkflowGuards?: boolean;
   preserveWorkflowPosition?: boolean;
+}
+
+interface CaptureWorkInput {
+  title: string;
+  description: string;
+  acceptanceCriteria: string[];
+  labels: string[];
+}
+
+interface CapturedWorkItem {
+  tracker: "github";
+  externalId: string;
+  url: string;
+  created: boolean;
+  warning: string | null;
 }
 
 function normalizeSummary(text: string | null): string | null {
@@ -579,7 +607,7 @@ export default function plugin(bb: BbPluginApi) {
 
   async function githubRpc<T>(
     method: string,
-    input: Record<string, string | number | boolean | null> | null,
+    input: JsonObject | null,
     outputSchema: z.ZodType<T>,
   ): Promise<T> {
     return await bb.sdk.plugins.callRpc<T>({
@@ -704,6 +732,165 @@ export default function plugin(bb: BbPluginApi) {
           Date.parse(right.updatedAt) - Date.parse(left.updatedAt),
       )
       .slice(0, limit);
+  }
+
+  function normalizedWorkTitle(title: string) {
+    return title.trim().replace(/\s+/g, " ").toLowerCase();
+  }
+
+  function capturedWorkBody(
+    input: CaptureWorkInput,
+    source: { id: string; title: string },
+  ) {
+    const criteria = input.acceptanceCriteria.length
+      ? [
+          "## Acceptance criteria",
+          "",
+          ...input.acceptanceCriteria.map((criterion) => `- ${criterion}`),
+        ].join("\n")
+      : null;
+    return [
+      input.description.trim(),
+      criteria,
+      [
+        "## Provenance",
+        "",
+        `Captured by Autobahn from bb thread \`${source.id}\` (${source.title}).`,
+      ].join("\n"),
+    ]
+      .filter((section): section is string => Boolean(section))
+      .join("\n\n");
+  }
+
+  async function captureGithubWorkItem(
+    input: CaptureWorkInput,
+    source: { id: string; projectId: string; title: string },
+  ): Promise<CapturedWorkItem> {
+    const snapshot = await loadGithubSnapshot(true);
+    const linkedRepos = [
+      ...new Set(
+        (linkedItemsByThread(snapshot).get(source.id) ?? []).map(
+          (item) => item.repo,
+        ),
+      ),
+    ];
+    const projectRepos = [
+      ...snapshot.projectByRepo.entries(),
+    ]
+      .filter(([, projectId]) => projectId === source.projectId)
+      .map(([repo]) => repo);
+    const linkedProjectRepos = linkedRepos.filter(
+      (repo) => snapshot.projectByRepo.get(repo) === source.projectId,
+    );
+    const candidateRepos = linkedProjectRepos.length
+      ? linkedProjectRepos
+      : projectRepos;
+    if (candidateRepos.length === 0) {
+      throw new Error(
+        "No issue tracker repository is configured for this project.",
+      );
+    }
+    if (candidateRepos.length > 1) {
+      throw new Error(
+        `Work capture is ambiguous because this project maps to multiple repositories: ${candidateRepos.join(", ")}. File the item explicitly in the tracker.`,
+      );
+    }
+    const repo = candidateRepos[0]!;
+    const duplicate = snapshot.items.find(
+      (item) =>
+        item.kind === "issue" &&
+        item.repo === repo &&
+        item.state.toLowerCase() === "open" &&
+        normalizedWorkTitle(item.title) === normalizedWorkTitle(input.title),
+    );
+    if (duplicate) {
+      workflowStore.appendEvent({
+        threadId: source.id,
+        type: "work.capture-reused",
+        payload: {
+          tracker: "github",
+          externalId: `${repo}#${duplicate.number}`,
+          url: duplicate.url,
+          title: input.title.trim(),
+        },
+      });
+      return {
+        tracker: "github",
+        externalId: `${repo}#${duplicate.number}`,
+        url: duplicate.url,
+        created: false,
+        warning: null,
+      };
+    }
+
+    const labels = [...new Set(input.labels.map((label) => label.trim()))];
+    const created = await githubRpc(
+      "createIssue",
+      {
+        repo,
+        title: input.title.trim(),
+        body: capturedWorkBody(input, source),
+      },
+      githubCreateIssueOutputSchema,
+    );
+    let warning: string | null = null;
+    if (labels.length) {
+      if (created.number === null) {
+        warning =
+          "Issue created, but labels could not be applied because its number was unavailable.";
+      } else {
+        try {
+          await githubRpc(
+            "setLabels",
+            { repo, number: created.number, labels },
+            githubSetLabelsOutputSchema,
+          );
+        } catch (error) {
+          warning = `Issue created, but labels could not be applied: ${String(error)}`;
+        }
+      }
+    }
+    githubSnapshotCache = null;
+    try {
+      await githubRpc("refresh", null, githubRefreshOutputSchema);
+    } catch (error) {
+      bb.log.debug(`GitHub refresh after work capture failed: ${String(error)}`);
+    }
+    githubSnapshotCache = null;
+    const externalId =
+      created.number === null ? created.url : `${repo}#${created.number}`;
+    workflowStore.appendEvent({
+      threadId: source.id,
+      type: "work.captured",
+      payload: {
+        tracker: "github",
+        externalId,
+        url: created.url,
+        title: input.title.trim(),
+        labels,
+        warning,
+      },
+    });
+    bb.realtime.publish("board-changed", {
+      threadId: source.id,
+      event: "work.captured",
+    });
+    return {
+      tracker: "github",
+      externalId,
+      url: created.url,
+      created: true,
+      warning,
+    };
+  }
+
+  async function captureWorkItem(
+    input: CaptureWorkInput,
+    source: { id: string; projectId: string; title: string },
+  ) {
+    // GitHub is the first adapter. Keep the agent contract tracker-neutral so
+    // another adapter, such as Linear, can be selected here later.
+    return await captureGithubWorkItem(input, source);
   }
 
   async function moveWarning(
@@ -1855,6 +2042,53 @@ export default function plugin(bb: BbPluginApi) {
   });
 
   bb.agents.registerTool({
+    name: "autobahn_capture_work",
+    description:
+      "Capture newly discovered durable work in the configured issue tracker without starting an agent session.",
+    instructions:
+      "Use this for net-new requirements found during brainstorming or closeout. Do not create a coding session merely to remember future work.",
+    experimental_statusLabels: {
+      pending: "Capturing discovered work",
+      completed: "Captured discovered work",
+    },
+    parameters: z
+      .object({
+        projectId: z.string().min(1).optional(),
+        title: z.string().min(1).max(160),
+        description: z.string().min(1).max(10_000),
+        acceptanceCriteria: z
+          .array(z.string().min(1).max(500))
+          .max(20)
+          .default([]),
+        labels: z.array(z.string().min(1).max(80)).max(10).default([]),
+      })
+      .strict(),
+    execute: async ({ projectId, ...input }, { threadId }) => {
+      const sourceThread = await bb.sdk.threads.get({ threadId });
+      const isDriver = threadId === driverThreadIdCache;
+      if (projectId && projectId !== sourceThread.projectId && !isDriver) {
+        throw new Error(
+          "Controller agents may capture work only in their current project.",
+        );
+      }
+      const result = await captureWorkItem(input, {
+        id: sourceThread.id,
+        projectId: projectId ?? sourceThread.projectId,
+        title:
+          sourceThread.title ?? sourceThread.titleFallback ?? sourceThread.id,
+      });
+      const action = result.created ? "Created" : "Reused existing";
+      return [
+        `${action} ${result.tracker} work item ${result.externalId}: ${result.url}.`,
+        "It remains in the roadmap; no agent session was started.",
+        result.warning,
+      ]
+        .filter(Boolean)
+        .join(" ");
+    },
+  });
+
+  bb.agents.registerTool({
     name: "autobahn_create_session",
     description:
       "Create and assign a new visible coding session in a project and place its card on the board.",
@@ -2546,6 +2780,7 @@ export default function plugin(bb: BbPluginApi) {
 
   const driverTools = [
     "autobahn_list_cards",
+    "autobahn_capture_work",
     "autobahn_create_session",
     "autobahn_assign_session",
     "autobahn_move_card",
@@ -2590,10 +2825,14 @@ export default function plugin(bb: BbPluginApi) {
             "You are the policy-driven Autobahn Driver. Inventory before acting; use fresh child sessions for planning and verification; enforce gates, dependencies, parking, and soft WIP; require typed exits and one Next action; never bypass human approval or auto-kill work.",
         }
       : {
-          tools: ["autobahn_move_thread", "autobahn_report_exit"],
+          tools: [
+            "autobahn_move_thread",
+            "autobahn_report_exit",
+            "autobahn_capture_work",
+          ],
           skills: [],
           instructions:
-            "Keep this controller card current and end every station pass with autobahn_report_exit, evidence, and one Next action. Build success advances to verification; only verified work reaches R4R; CLOSED requires a clean final exit.",
+            "Keep this controller card current and end every station pass with autobahn_report_exit, evidence, and one Next action. Capture newly discovered durable work with autobahn_capture_work instead of starting speculative sessions. Build success advances to verification; only verified work reaches R4R; CLOSED requires a clean final exit.",
         };
   });
 

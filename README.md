@@ -23,6 +23,14 @@ Open controller threads render as ordinary cards; the compact roadmap cards are
 reserved for unstarted issues, link to GitHub, and can be turned into stopped
 Open sessions by the Driver.
 
+Controller agents can call `autobahn_capture_work` when brainstorming or
+closeout reveals durable future work. The tracker-neutral tool takes a title,
+description, optional acceptance criteria, and optional labels. Today a small
+GitHub adapter infers the current project repository, reuses an exact-title open
+issue when possible, creates the issue otherwise, records source-thread
+provenance, refreshes the roadmap, and never starts an agent session. The public
+tool contract can remain unchanged when another tracker adapter is added.
+
 Closed follows external work state. A linked issue or pull request closing or
 merging moves its card to Closed. If external work reopens, an unverified card
 returns to Open and a verified card returns to R4R. Autobahn checks this on board
@@ -35,7 +43,7 @@ and immediately reconciles the current GitHub state.
 
 Workflow metadata is orthogonal to those sections. A color-coded corner tick
 shows the live operational state: muted for idle or queued, primary for an active
-agent, warning for parked, ring-color for human attention, destructive for blocked
+agent, warning for parked, attention-color for human attention, destructive for blocked
 or failed, and success for complete. Cards also show phase, gate, risk, priority,
 evidence and concern counts, one required `Next:` action, native bb or PR
 attention, project, harness logo, model, context usage, and external links.
@@ -46,6 +54,8 @@ Driver dispatches only into available capacity.
 ## Workflow
 
 - A visible card thread is the stable controller and human conversation.
+- Newly discovered future work is captured in the issue tracker before it becomes
+  an execution session; ordinary controller agents and the Driver share this tool.
 - Planning spawns an isolated planner child with a read-only contract followed
   by a fresh adversarial reviewer, with at most two revision rounds. Review
   children use disposable managed worktrees and receive no Autobahn mutation
@@ -71,9 +81,9 @@ Driver dispatches only into available capacity.
 The steering-wheel button in the board header opens a persistent Driver thread
 in a right-side panel. It can inventory, create, assign, contract, plan, approve,
 verify, dispatch, move, park, wake, witness, stop, archive, and unarchive sessions.
-It can also start prioritized roadmap issues and set or clear explicit status
-overrides. Its hidden runtime is released whenever idle and resumes on the next
-message.
+It can also capture tracker work, start prioritized roadmap issues, and set or
+clear explicit status overrides. Its hidden runtime is released whenever idle and
+resumes on the next message.
 
 ## Development
 
