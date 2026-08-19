@@ -1029,6 +1029,152 @@ function WorkCaptureApprovalInteraction({
   );
 }
 
+function GateDecisionInteraction({
+  interaction,
+  submit,
+  cancel,
+}: PluginPendingInteractionProps) {
+  const payload =
+    interaction.payload &&
+    typeof interaction.payload === "object" &&
+    !Array.isArray(interaction.payload)
+      ? interaction.payload
+      : {};
+  const cardThreadId =
+    "cardThreadId" in payload && typeof payload.cardThreadId === "string"
+      ? payload.cardThreadId
+      : "unknown card";
+  const cardTitle =
+    "cardTitle" in payload && typeof payload.cardTitle === "string"
+      ? payload.cardTitle
+      : cardThreadId;
+  const objective =
+    "objective" in payload && typeof payload.objective === "string"
+      ? payload.objective
+      : "";
+  const reason =
+    "reason" in payload && typeof payload.reason === "string"
+      ? payload.reason
+      : "";
+  const evidence =
+    "evidence" in payload && Array.isArray(payload.evidence)
+      ? payload.evidence.filter(
+          (item): item is { label: string; url?: string; path?: string } =>
+            !!item &&
+            typeof item === "object" &&
+            "label" in item &&
+            typeof item.label === "string",
+        )
+      : [];
+  const concerns =
+    "concerns" in payload && Array.isArray(payload.concerns)
+      ? payload.concerns.filter(
+          (item): item is string => typeof item === "string",
+        )
+      : [];
+  const [note, setNote] = useState("");
+
+  return (
+    <div className="space-y-3 rounded-lg border border-border bg-card p-3">
+      <div>
+        <p className="text-xs font-semibold text-foreground">
+          Approve DONE for {cardTitle}?
+        </p>
+        {objective ? (
+          <p className="mt-1 text-xs text-muted-foreground">{objective}</p>
+        ) : null}
+        {reason ? (
+          <p className="mt-1 text-xs text-muted-foreground">{reason}</p>
+        ) : null}
+      </div>
+      <div className="space-y-1 text-[11px] text-muted-foreground">
+        {evidence.length ? (
+          <div>
+            <p className="font-medium text-foreground">Evidence</p>
+            <ul className="list-disc pl-4">
+              {evidence.map((item) => (
+                <li key={item.label}>
+                  {item.url ? (
+                    <a
+                      href={item.url}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="underline"
+                    >
+                      {item.label}
+                    </a>
+                  ) : (
+                    item.label
+                  )}
+                  {item.path ? ` (${item.path})` : null}
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+        {concerns.length ? (
+          <div>
+            <p className="font-medium text-foreground">Concerns</p>
+            <ul className="list-disc pl-4">
+              {concerns.map((concern) => (
+                <li key={concern}>{concern}</li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+      </div>
+      <textarea
+        value={note}
+        onChange={(event) => setNote(event.target.value)}
+        placeholder="Optional note, or the gaps to send back"
+        aria-label="Gate decision note"
+        className="min-h-20 w-full resize-y rounded-md border border-border bg-background px-2.5 py-2 text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+      />
+      <div className="flex flex-wrap justify-end gap-2">
+        <Button variant="ghost" size="sm" onClick={() => void cancel()}>
+          Cancel
+        </Button>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() =>
+            void submit({
+              decision: "snooze",
+              note: note.trim(),
+              snoozeUntilEpochMs: Date.now() + 24 * 60 * 60 * 1_000,
+            })
+          }
+        >
+          Snooze 1 day
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() =>
+            void submit({
+              decision: "send-back",
+              note: note.trim() || "Gaps identified at the egress gate",
+            })
+          }
+        >
+          Send back with gaps
+        </Button>
+        <Button
+          size="sm"
+          onClick={() =>
+            void submit({
+              decision: "approve",
+              note: note.trim(),
+            })
+          }
+        >
+          Approve DONE
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 function DriverPanel() {
   const rpc = useRpc<typeof rpcContract>();
   const [open, setOpen] = useState(false);
@@ -1131,6 +1277,10 @@ export default definePluginApp((app) => {
   app.slots.pendingInteraction({
     id: "work-capture-approval",
     component: WorkCaptureApprovalInteraction,
+  });
+  app.slots.pendingInteraction({
+    id: "gate-decision",
+    component: GateDecisionInteraction,
   });
   app.slots.navPanel({
     id: "autobahn-board",

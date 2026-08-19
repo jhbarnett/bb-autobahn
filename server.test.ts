@@ -806,6 +806,7 @@ describe("autobahn backend", () => {
       "autobahn_set_contract",
       "autobahn_run_plan",
       "autobahn_approve_plan",
+      "autobahn_gate_decision",
       "autobahn_run_verification",
       "autobahn_dispatch_ready",
       "autobahn_park_card",
@@ -1125,6 +1126,294 @@ describe("autobahn backend", () => {
         projectId: "project-1",
       }),
     ).resolves.toContain("queue is healthy");
+  });
+
+  it("gates verified merged cards behind a human decision instead of auto-closing", async () => {
+    const sections = ["OPEN", "WIP", "R4R", "CLOSED"].map((name) => ({
+      id: `section-${name}`,
+      name,
+      createdAt: 1,
+      updatedAt: 1,
+    }));
+    const row = {
+      id: "thread-1",
+      projectId: "project-1",
+      environmentId: "environment-1",
+      providerId: "codex",
+      title: "Gated card",
+      titleFallback: null,
+      sectionId: "section-OPEN",
+      status: "idle",
+      hasPendingInteraction: false,
+      environmentBranchName: "feature/gate",
+      updatedAt: Date.now(),
+    };
+    let prState: string | null = null;
+    let spawned = 0;
+    const passReport = JSON.stringify({
+      verdict: "PASS",
+      summary: "No findings.",
+      findings: [],
+    });
+    const update = vi.fn(({ sectionId }) => {
+      if (sectionId) row.sectionId = sectionId;
+      return row;
+    });
+    const send = vi.fn(() => ({ ok: true }));
+    const stop = vi.fn(() => ({ ok: true }));
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "autobahn",
+      agentSkillIds: ["autobahn-driver"],
+      sdk: {
+        threadSections: {
+          list: () => sections,
+          create: ({ name }) => ({
+            id: `section-${name}`,
+            name,
+            createdAt: 1,
+            updatedAt: 1,
+          }),
+        },
+        projects: {
+          list: () => [
+            {
+              id: "project-1",
+              name: "Agentbox",
+              kind: "standard",
+              gitRemoteUrl: null,
+              createdAt: 1,
+              updatedAt: 1,
+              sources: [],
+            },
+          ],
+        },
+        environments: {
+          get: () => ({
+            hostId: "host-1",
+            isGitRepo: true,
+            branchName: "feature/gate",
+          }),
+          status: async () => ({ outcome: "unavailable" }),
+          pullRequest: async () =>
+            prState === null
+              ? { outcome: "absent" }
+              : {
+                  outcome: "available",
+                  pullRequest: {
+                    number: 9,
+                    title: "Gated card",
+                    state: prState,
+                    url: "https://github.com/acme/repo/pull/9",
+                    attention: null,
+                    checks: { state: "passing" },
+                  },
+                },
+        },
+        threads: {
+          list: (args) =>
+            args?.sectionId && row.sectionId !== args.sectionId ? [] : [row],
+          get: ({ threadId }) => ({
+            ...(threadId === "thread-1"
+              ? row
+              : { id: threadId, projectId: "project-1" }),
+            archivedAt: null,
+            deletedAt: null,
+          }),
+          spawn: () => ({ id: `child-${++spawned}` }),
+          wait: async () => ({ ok: true }),
+          update,
+          send,
+          stop,
+          archive: async () => ({ ok: true }),
+          defaultExecutionOptions: async () => ({
+            model: "gpt-5.6",
+            reasoningLevel: "high",
+            permissionMode: "auto",
+            serviceTier: "default",
+            source: "client/turn/start",
+          }),
+          timeline: async () => ({ rows: [] }),
+          output: async ({ threadId }) =>
+            typeof threadId === "string" && threadId.startsWith("child-")
+              ? { output: passReport }
+              : { output: "Ready." },
+          interactions: { list: async () => [] },
+        },
+      },
+    });
+    plugin(bb);
+
+    await harness.behavior.callAgentTool("autobahn_set_contract", {
+      threadId: "thread-1",
+      riskClass: "low",
+      priority: 1,
+      blockedBy: [],
+      requiresHumanApproval: false,
+      contract: {
+        objective: "Ship the gated feature",
+        scope: ["server.ts"],
+        outOfScope: ["docs"],
+        expectedFiles: ["server.ts"],
+        acceptanceCriteria: ["gate decisions are explicit"],
+        verificationCommands: ["npm test"],
+      },
+    });
+    await expect(
+      harness.behavior.callAgentTool(
+        "autobahn_dispatch_ready",
+        { projectId: "project-1" },
+        { threadId: "driver-thread" },
+      ),
+    ).resolves.toContain("Dispatched 1");
+    await harness.behavior.callAgentTool(
+      "autobahn_report_exit",
+      {
+        phase: "build",
+        status: "DONE",
+        summary: "Implemented.",
+        nextAction: "Run verification",
+        concerns: [],
+        evidence: [{ label: "Unit tests" }],
+      },
+      { threadId: "thread-1" },
+    );
+    await expect(
+      harness.behavior.callAgentTool("autobahn_run_verification", {
+        threadId: "thread-1",
+        objective: "Ship the gated feature",
+      }),
+    ).resolves.toContain("Verification DONE");
+    expect(row.sectionId).toBe("section-R4R");
+
+    prState = "merged";
+    const board = (await harness.behavior.callRpc("listBoard", {})) as {
+      lanes: Array<{ status: string; cards: Array<{ id: string }> }>;
+    };
+    expect(
+      board.lanes.find((lane) => lane.status === "R4R")?.cards.map(
+        (card) => card.id,
+      ),
+    ).toEqual(["thread-1"]);
+    await vi.waitFor(() => {
+      expect(harness.inspection.pendingInteractions).toHaveLength(1);
+    });
+    const raised = harness.inspection.pendingInteractions[0]!;
+    expect(raised.rendererId).toBe("gate-decision");
+    expect(raised.threadId).toBe("thread-1");
+    expect(raised.payload).toMatchObject({
+      cardThreadId: "thread-1",
+      cardTitle: "Gated card",
+      objective: "Ship the gated feature",
+    });
+    expect(JSON.stringify(raised.payload).length).toBeLessThan(64 * 1024);
+    await expect(
+      harness.behavior.callAgentTool("autobahn_witness", {
+        projectId: "project-1",
+      }),
+    ).resolves.toContain(
+      "thread-1: gate-ready — human egress decision requested",
+    );
+    expect(harness.inspection.pendingInteractions).toHaveLength(1);
+
+    harness.behavior.submitInteraction(raised.id, {
+      decision: "snooze",
+      note: "Later",
+      snoozeUntilEpochMs: Date.now() + 60 * 60 * 1_000,
+    });
+    await vi.waitFor(async () => {
+      const snoozed = (await harness.behavior.callRpc("listBoard", {})) as {
+        lanes: Array<{
+          status: string;
+          cards: Array<{ workflow: { parkedWake: { kind: string } | null } }>;
+        }>;
+      };
+      expect(
+        snoozed.lanes.find((lane) => lane.status === "R4R")?.cards[0]?.workflow
+          .parkedWake,
+      ).toMatchObject({ kind: "timer" });
+    });
+    expect(row.sectionId).toBe("section-R4R");
+    expect(harness.inspection.pendingInteractions).toHaveLength(0);
+
+    await harness.behavior.callAgentTool("autobahn_wake_card", {
+      threadId: "thread-1",
+      reason: "Revisit the gate",
+      nextAction: "Decide the gate",
+    });
+    const decision = harness.behavior.callAgentTool(
+      "autobahn_gate_decision",
+      { threadId: "thread-1", reason: "PR merged with evidence" },
+      { threadId: "driver-thread" },
+    );
+    await vi.waitFor(() => {
+      expect(harness.inspection.pendingInteractions).toHaveLength(1);
+    });
+    harness.behavior.submitInteraction(
+      harness.inspection.pendingInteractions[0]!.id,
+      { decision: "send-back", note: "Missing changelog" },
+    );
+    await expect(decision).resolves.toContain("back to WIP");
+    expect(row.sectionId).toBe("section-WIP");
+    const sentBack = (await harness.behavior.callRpc("listBoard", {})) as {
+      lanes: Array<{
+        status: string;
+        cards: Array<{
+          workflow: { phase: string; concerns: string[]; nextAction: string | null };
+        }>;
+      }>;
+    };
+    const sentBackCard = sentBack.lanes.find(
+      (lane) => lane.status === "WIP",
+    )?.cards[0];
+    expect(sentBackCard?.workflow.phase).toBe("build");
+    expect(sentBackCard?.workflow.concerns).toContain("Missing changelog");
+    expect(sentBackCard?.workflow.nextAction).toContain("Missing changelog");
+    expect(harness.inspection.pendingInteractions).toHaveLength(0);
+
+    await harness.behavior.callAgentTool(
+      "autobahn_report_exit",
+      {
+        phase: "build",
+        status: "DONE",
+        summary: "Changelog added.",
+        nextAction: "Run verification",
+        concerns: [],
+        evidence: [{ label: "Changelog" }],
+      },
+      { threadId: "thread-1" },
+    );
+    await expect(
+      harness.behavior.callAgentTool("autobahn_run_verification", {
+        threadId: "thread-1",
+        objective: "Ship the gated feature",
+      }),
+    ).resolves.toContain("Verification DONE");
+    expect(row.sectionId).toBe("section-R4R");
+
+    await harness.behavior.callRpc("listBoard", {});
+    await vi.waitFor(() => {
+      expect(harness.inspection.pendingInteractions).toHaveLength(1);
+    });
+    harness.behavior.submitInteraction(
+      harness.inspection.pendingInteractions[0]!.id,
+      { decision: "approve", note: "Ship it" },
+    );
+    await vi.waitFor(() => {
+      expect(row.sectionId).toBe("section-CLOSED");
+    });
+    const closed = (await harness.behavior.callRpc("listBoard", {})) as {
+      lanes: Array<{
+        status: string;
+        cards: Array<{
+          workflow: { phase: string; exitStatus: string | null };
+        }>;
+      }>;
+    };
+    const closedCard = closed.lanes.find(
+      (lane) => lane.status === "CLOSED",
+    )?.cards[0];
+    expect(closedCard?.workflow.phase).toBe("complete");
+    expect(closedCard?.workflow.exitStatus).toBe("DONE");
   });
 
   it("runs witness checks on lifecycle events and auto-clears archived CLOSED cards", async () => {

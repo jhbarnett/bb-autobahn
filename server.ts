@@ -92,6 +92,9 @@ const WITNESS_PROBE_TITLE = "Autobahn witness probe";
 const LEGACY_ROADMAP_SNOOZES_KEY = "roadmap-snoozes";
 const CLOSED_DISMISSALS_KEY = "closed-card-dismissals";
 const MAX_SNOOZE_MS = 366 * 24 * 60 * 60 * 1_000;
+const GATE_DECISION_RENDERER = "gate-decision";
+const GATE_DECISION_TIMEOUT_MS = 30 * 60 * 1_000;
+const DEFAULT_GATE_SNOOZE_MS = 24 * 60 * 60 * 1_000;
 const HAND_RAISE_LABELS = new Set([
   "blocked",
   "needs-input",
@@ -155,6 +158,13 @@ const planContractSchema = z.object({
   acceptanceCriteria: z.array(z.string()),
   verificationCommands: z.array(z.string()),
 });
+const gateDecisionSchema = z
+  .object({
+    decision: z.enum(["approve", "send-back", "snooze"]),
+    note: z.string().max(10_000),
+    snoozeUntilEpochMs: z.number().int().positive().optional(),
+  })
+  .strict();
 const statusOverrideSchema = z.enum(STATUS_OVERRIDES);
 const workflowStateSchema = z.object({
   phase: workflowPhaseSchema,
@@ -706,6 +716,7 @@ export default function plugin(bb: BbPluginApi) {
     })
     .catch(() => undefined);
   let dispatching = false;
+  const inFlightGateDecisions = new Set<string>();
 
   async function ensureDriver(): Promise<string> {
     if (driverCreation) return driverCreation;
@@ -1409,6 +1420,23 @@ export default function plugin(bb: BbPluginApi) {
           )?.[0] as BoardStatus | undefined) ?? "OPEN";
         let destination: BoardStatus | null = null;
         if (externalClosed && currentStatus !== "CLOSED") {
+          if (
+            currentStatus === "R4R" &&
+            workflow?.phase === "egress" &&
+            workflow.evidence.length > 0
+          ) {
+            // The egress gate is a human decision: raise the interaction
+            // instead of closing the verified card automatically.
+            if (
+              workflow.parkedWake === null &&
+              !thread.hasPendingInteraction &&
+              !inFlightGateDecisions.has(thread.id)
+            ) {
+              raiseGateDecisions([{ threadId: thread.id, reason }]);
+            }
+            continue;
+          }
+          if (gateSendBackActive(thread.id)) continue;
           destination = "CLOSED";
         } else if (
           !externalClosed &&
@@ -2176,11 +2204,46 @@ export default function plugin(bb: BbPluginApi) {
     return woken;
   }
 
-  async function witnessFindings(projectId?: string) {
+  interface GateReadyCard {
+    threadId: string;
+    reason: string;
+  }
+
+  function gateSendBackActive(threadId: string) {
+    let active = false;
+    for (const event of workflowStore.listEvents(threadId)) {
+      if (event.type === "gate.sent-back") active = true;
+      else if (event.type === "gate.approved") active = false;
+    }
+    return active;
+  }
+
+  async function witnessReport(projectId?: string) {
     const board = await listBoard(projectId);
-    return board.lanes.flatMap((lane) =>
+    const gateReady: GateReadyCard[] = [];
+    const findings = board.lanes.flatMap((lane) =>
       lane.cards.flatMap((card) => {
         const findings: string[] = [];
+        const mergedPullRequest = card.links.some(
+          (link) => link.kind === "pull-request" && link.state === "merged",
+        );
+        const gateReadyCard =
+          lane.status === "R4R" &&
+          card.workflow.phase === "egress" &&
+          card.workflow.evidence.length > 0 &&
+          card.workflow.parkedWake === null &&
+          !card.attention.includes("needs-input") &&
+          mergedPullRequest;
+        if (gateReadyCard) {
+          gateReady.push({
+            threadId: card.id,
+            reason:
+              "Merged pull request with verification evidence is waiting on the egress gate",
+          });
+          findings.push(
+            `${card.id}: gate-ready — human egress decision requested`,
+          );
+        }
         if (card.attention.includes("stale")) {
           findings.push(`${card.id}: stale in ${lane.status}`);
         }
@@ -2205,12 +2268,7 @@ export default function plugin(bb: BbPluginApi) {
         if (card.attention.includes("changes-requested")) {
           findings.push(`${card.id}: review changes requested`);
         }
-        if (
-          card.status !== "CLOSED" &&
-          card.links.some(
-            (link) => link.kind === "pull-request" && link.state === "merged",
-          )
-        ) {
+        if (!gateReadyCard && card.status !== "CLOSED" && mergedPullRequest) {
           findings.push(`${card.id}: pull request merged but card is not CLOSED`);
         }
         if (
@@ -2231,6 +2289,160 @@ export default function plugin(bb: BbPluginApi) {
         return findings;
       }),
     );
+    return { findings, gateReady };
+  }
+
+  async function witnessFindings(projectId?: string) {
+    return (await witnessReport(projectId)).findings;
+  }
+
+  async function applyGateDecision(
+    threadId: string,
+    decision: z.infer<typeof gateDecisionSchema>,
+  ): Promise<string> {
+    const state = workflowStore.get(threadId);
+    if (!state) {
+      throw new Error(`The card ${threadId} has no workflow state.`);
+    }
+    const note = decision.note.trim();
+    if (decision.decision === "approve") {
+      workflowStore.reportExit({
+        threadId,
+        phase: "egress",
+        status: "DONE",
+        summary: note || "Human approved the egress gate",
+        nextAction: "No action",
+        concerns: state.concerns,
+        evidence: state.evidence,
+        gate: "none",
+      });
+      workflowStore.appendEvent({
+        threadId,
+        type: "gate.approved",
+        payload: { note },
+      });
+      await moveThread(threadId, "CLOSED", {
+        source: "user",
+        reason: "Human approved the egress gate",
+      });
+      return `Gate approved; ${threadId} moved to CLOSED.`;
+    }
+    if (decision.decision === "send-back") {
+      const gaps = note || "Gaps identified at the egress gate";
+      workflowStore.reportExit({
+        threadId,
+        phase: "egress",
+        status: "BLOCKED",
+        summary: gaps,
+        nextAction: `Close the gate gaps: ${gaps}`,
+        concerns: [...state.concerns, gaps],
+        evidence: state.evidence,
+        gate: "none",
+      });
+      workflowStore.appendEvent({
+        threadId,
+        type: "gate.sent-back",
+        payload: { note: gaps },
+      });
+      await moveThread(threadId, "WIP", {
+        source: "user",
+        reason: "Human sent the card back with gaps",
+        bypassWorkflowGuards: true,
+      });
+      workflowStore.upsert(threadId, {
+        nextAction: `Close the gate gaps: ${gaps}`,
+      });
+      await notifyController(
+        threadId,
+        `The human egress gate sent this card back with gaps: ${gaps}. Close the gaps, rerun verification, and report a typed exit.`,
+      );
+      return `Gate sent ${threadId} back to WIP with gaps: ${gaps}`;
+    }
+    const now = Date.now();
+    const until = decision.snoozeUntilEpochMs ?? now + DEFAULT_GATE_SNOOZE_MS;
+    if (until <= now || until > now + MAX_SNOOZE_MS) {
+      throw new Error("Gate snooze must end in the future within 366 days.");
+    }
+    workflowStore.park({
+      threadId,
+      wake: { kind: "timer", ref: null, until },
+      nextAction: "Revisit the egress gate decision",
+    });
+    workflowStore.appendEvent({
+      threadId,
+      type: "gate.snoozed",
+      payload: { until, note },
+    });
+    bb.realtime.publish("board-changed", { threadId, event: "gate.snoozed" });
+    return `Gate snoozed for ${threadId} until ${new Date(until).toISOString()}.`;
+  }
+
+  async function requestGateDecision(
+    input: { threadId: string; reason: string },
+    options: { signal?: AbortSignal } = {},
+  ): Promise<string> {
+    const { threadId } = input;
+    if (inFlightGateDecisions.has(threadId)) {
+      return `A gate decision is already pending for ${threadId}.`;
+    }
+    const state = workflowStore.get(threadId);
+    if (!state || state.phase !== "egress" || state.evidence.length === 0) {
+      throw new Error(
+        "A gate decision requires a card at egress with verification evidence.",
+      );
+    }
+    const thread = await bb.sdk.threads.get({ threadId });
+    inFlightGateDecisions.add(threadId);
+    try {
+      // The payload is a compact summary; the decision response is delivered
+      // only to this waiting invocation and stays well under the 64 KiB cap.
+      const interaction = await bb.ui.requestInput(
+        {
+          threadId,
+          rendererId: GATE_DECISION_RENDERER,
+          title: "Autobahn gate decision",
+          payload: {
+            cardThreadId: threadId,
+            cardTitle: (thread.title ?? thread.titleFallback ?? threadId).slice(
+              0,
+              200,
+            ),
+            objective: (state.planContract?.objective ?? "").slice(0, 500),
+            reason: input.reason.slice(0, 500),
+            evidence: state.evidence.slice(0, 12).map((item) => ({
+              label: item.label.slice(0, 200),
+              ...(item.url ? { url: item.url.slice(0, 500) } : {}),
+              ...(item.path ? { path: item.path.slice(0, 500) } : {}),
+            })),
+            concerns: state.concerns
+              .slice(0, 12)
+              .map((concern) => concern.slice(0, 300)),
+          },
+          timeoutMs: GATE_DECISION_TIMEOUT_MS,
+        },
+        options.signal ? { signal: options.signal } : {},
+      );
+      if (interaction.outcome === "cancelled") {
+        return `Gate decision cancelled for ${threadId}; the card is unchanged.`;
+      }
+      const decision = gateDecisionSchema.parse(interaction.value);
+      return await applyGateDecision(threadId, decision);
+    } finally {
+      inFlightGateDecisions.delete(threadId);
+    }
+  }
+
+  function raiseGateDecisions(gateReady: GateReadyCard[]) {
+    for (const gate of gateReady) {
+      if (inFlightGateDecisions.has(gate.threadId)) continue;
+      void requestGateDecision(gate).then(
+        (outcome) => bb.log.info(`Autobahn gate decision: ${outcome}`),
+        (error) =>
+          bb.log.warn(
+            `Autobahn gate decision failed for ${gate.threadId}: ${String(error)}`,
+          ),
+      );
+    }
   }
 
   async function runHiddenWorker(input: {
@@ -2303,8 +2515,12 @@ export default function plugin(bb: BbPluginApi) {
       return;
     }
     if (thread.archivedAt || thread.deletedAt) return;
-    const findings = (await witnessFindings(thread.projectId)).filter(
-      (finding) => finding.startsWith(`${threadId}: `),
+    const report = await witnessReport(thread.projectId);
+    raiseGateDecisions(
+      report.gateReady.filter((gate) => gate.threadId === threadId),
+    );
+    const findings = report.findings.filter((finding) =>
+      finding.startsWith(`${threadId}: `),
     );
     const fingerprintKey = `${WITNESS_FINGERPRINT_KEY}:${threadId}`;
     const fingerprint = JSON.stringify(findings);
@@ -2999,6 +3215,26 @@ export default function plugin(bb: BbPluginApi) {
   });
 
   bb.agents.registerTool({
+    name: "autobahn_gate_decision",
+    description:
+      "Open the blocking human egress gate form (approve, send back with gaps, or snooze) for a verified card.",
+    instructions:
+      "Raise this when a verified R4R card is ready to close, for example after its pull request merged with verification evidence attached. Never decide the gate yourself; the human response is applied directly.",
+    experimental_statusLabels: {
+      pending: "Requesting gate decision",
+      completed: "Recorded gate decision",
+    },
+    parameters: z
+      .object({
+        threadId: z.string().min(1),
+        reason: z.string().min(1),
+      })
+      .strict(),
+    execute: async ({ threadId, reason }, { signal }) =>
+      await requestGateDecision({ threadId, reason }, { signal }),
+  });
+
+  bb.agents.registerTool({
     name: "autobahn_run_verification",
     description:
       "Run parallel fresh-context verification lenses and a fresh validator for every proposed finding.",
@@ -3248,6 +3484,7 @@ export default function plugin(bb: BbPluginApi) {
     "autobahn_set_contract",
     "autobahn_run_plan",
     "autobahn_approve_plan",
+    "autobahn_gate_decision",
     "autobahn_run_verification",
     "autobahn_dispatch_ready",
     "autobahn_park_card",
@@ -3370,7 +3607,8 @@ export default function plugin(bb: BbPluginApi) {
   });
 
   bb.background.schedule("witness-scan", "*/15 * * * *", async () => {
-    const findings = await witnessFindings();
+    const { findings, gateReady } = await witnessReport();
+    raiseGateDecisions(gateReady);
     const fingerprint = JSON.stringify(findings);
     const previous =
       (await bb.storage.kv.get<string>(WITNESS_FINGERPRINT_KEY)) ?? "";
