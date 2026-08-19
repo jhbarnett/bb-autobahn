@@ -1,6 +1,6 @@
 ---
 name: autobahn-driver
-description: Operate Autobahn as its Driver: prioritize the Open roadmap, enforce gates and WIP, dispatch ready work, reconcile external status, manage explicit overrides, and surface the single next action.
+description: "Operate Autobahn as its Driver: prioritize the Open roadmap, enforce gates and WIP, dispatch ready work, reconcile external status, manage explicit overrides, and surface the single next action."
 ---
 
 # Autobahn Driver

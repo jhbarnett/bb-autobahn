@@ -1,8 +1,12 @@
+import { readdirSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import {
   createFakePluginHost,
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
+import { parse } from "yaml";
 import plugin, { rankRoadmapItems } from "./server";
 
 describe("autobahn backend", () => {
@@ -980,5 +984,121 @@ describe("autobahn backend", () => {
         projectId: "project-1",
       }),
     ).resolves.toContain("queue is healthy");
+  });
+
+  it("selects only skill ids shipped by the manifest's skills directory", async () => {
+    const skillsRoot = join(
+      dirname(fileURLToPath(import.meta.url)),
+      "skills",
+    );
+    const shippedSkillIds = readdirSync(skillsRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => {
+        const raw = readFileSync(
+          join(skillsRoot, entry.name, "SKILL.md"),
+          "utf8",
+        );
+        const frontmatterMatch = raw.match(/^---\n([\s\S]*?)\n---\n/);
+        expect(
+          frontmatterMatch,
+          `skills/${entry.name}/SKILL.md must start with YAML frontmatter`,
+        ).not.toBeNull();
+        const frontmatter = parse(frontmatterMatch![1]) as {
+          name?: unknown;
+          description?: unknown;
+        };
+        expect(
+          frontmatter.name,
+          `skills/${entry.name}/SKILL.md frontmatter name must match its directory`,
+        ).toBe(entry.name);
+        expect(typeof frontmatter.description).toBe("string");
+        return entry.name;
+      });
+
+    const sections = ["OPEN", "WIP", "R4R", "CLOSED"].map((name) => ({
+      id: `section-${name}`,
+      name,
+      createdAt: 1,
+      updatedAt: 1,
+    }));
+    const spawn = vi.fn(({ title, visibility }) => ({
+      id:
+        title === "Autobahn Driver" && visibility === "hidden"
+          ? "driver-thread"
+          : "worker-thread",
+    }));
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "autobahn",
+      agentSkillIds: shippedSkillIds,
+      sdk: {
+        threadSections: {
+          list: () => sections,
+          create: ({ name }) => ({
+            id: `section-${name}`,
+            name,
+            createdAt: 1,
+            updatedAt: 1,
+          }),
+        },
+        projects: {
+          list: () => [
+            {
+              id: "personal-project",
+              name: "Personal",
+              kind: "personal",
+              gitRemoteUrl: null,
+              createdAt: 1,
+              updatedAt: 1,
+              sources: [],
+            },
+          ],
+        },
+        threads: {
+          spawn,
+          get: () => ({
+            id: "driver-thread",
+            projectId: "personal-project",
+            environmentId: "personal-environment",
+            sectionId: null,
+            archivedAt: null,
+            deletedAt: null,
+          }),
+        },
+      },
+    });
+    plugin(bb);
+
+    await expect(
+      harness.behavior.callRpc("getDriver"),
+    ).resolves.toEqual({ threadId: "driver-thread" });
+
+    const driverConfig = await harness.behavior.resolveAgentConfiguration({
+      thread: {
+        id: "driver-thread",
+        title: "Autobahn Driver",
+        parentThreadId: null,
+        sourceThreadId: null,
+      },
+      project: {
+        id: "personal-project",
+        kind: "personal",
+        name: "Personal",
+        gitRemoteUrl: null,
+      },
+      environment: {
+        id: "personal-environment",
+        name: null,
+        path: null,
+        workspaceProvisionType: "personal",
+        branchName: null,
+      },
+      host: { id: "host-1", name: "Local" },
+      provider: { id: "codex", model: "gpt-5.6" },
+      origin: { kind: null, pluginId: "autobahn" },
+    });
+    expect(driverConfig.skills).toEqual(["autobahn-driver"]);
+    for (const skillId of driverConfig.skills) {
+      expect(shippedSkillIds).toContain(skillId);
+    }
   });
 });

@@ -45,6 +45,7 @@
     "sonner": "2.0.8",
     "typescript": "5.9.3",
     "vitest": "4.1.11",
+    "yaml": "2.9.0",
     "bb-app": "0.38.0"
   },
   "scripts": {
