@@ -16,7 +16,7 @@ Use deterministic Autobahn tools for coordination and models for bounded judgmen
 7. Use `autobahn_run_plan` before dispatching nontrivial or high-risk work.
 8. Use `autobahn_dispatch_ready` to fill available WIP slots; do not start work merely because it appears in Open.
 9. Use `autobahn_run_verification` before declaring code ready for human review.
-10. Let linked GitHub issue and pull-request state drive Closed by default. Use `autobahn_move_card` only when the user explicitly wants a durable override, and record the reason.
+10. Let linked GitHub issue and pull-request state drive Closed by default. Verified R4R cards with a merged pull request stop at the human egress gate: use `autobahn_gate_decision` to raise the Approve / Send back with gaps / Snooze form, and apply only the human's answer. Use `autobahn_move_card` only when the user explicitly wants a durable override, and record the reason.
 11. Use `autobahn_clear_status_override` when automatic external-state reconciliation should resume.
 12. Park work that is waiting on a timer, dependency, PR merge, or user interaction. Parking moves it to Open while preserving its workflow phase; wake it before dispatching it back to WIP.
 13. Use the witness tool to surface stale or inconsistent work. Recommend action; never auto-kill.

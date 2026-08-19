@@ -445,4 +445,66 @@ describe("autobahn panel", () => {
     });
     interaction.lifecycle.unmount();
   });
+
+  it("offers approve, send back, and snooze on the gate decision form", async () => {
+    const app = await loadPluginApp(() => import("./app"));
+    const submit = vi.fn(async () => undefined);
+    const cancel = vi.fn(async () => undefined);
+    const interaction = renderSlot(
+      app.pendingInteractions[2]!,
+      {
+        interaction: {
+          id: "interaction-gate",
+          threadId: "thread-1",
+          title: "Autobahn gate decision",
+          payload: {
+            cardThreadId: "thread-1",
+            cardTitle: "Gated card",
+            objective: "Ship the gated feature",
+            reason: "Merged pull request with verification evidence",
+            evidence: [
+              {
+                label: "Verification panel: 4 lenses; 0 confirmed; 0 rejected",
+              },
+              {
+                label: "PR #9",
+                url: "https://github.com/acme/repo/pull/9",
+              },
+            ],
+            concerns: ["low: flaky retry"],
+          },
+          createdAt: 1,
+          expiresAt: null,
+        },
+        submit,
+        cancel,
+      },
+    );
+
+    expect(interaction.getByText("Approve DONE for Gated card?")).toBeTruthy();
+    expect(interaction.getByText("PR #9")).toBeTruthy();
+    expect(interaction.getByText("low: flaky retry")).toBeTruthy();
+    fireEvent.change(interaction.getByLabelText("Gate decision note"), {
+      target: { value: "Missing changelog" },
+    });
+    fireEvent.click(
+      interaction.getByRole("button", { name: "Send back with gaps" }),
+    );
+    await vi.waitFor(() => {
+      expect(submit).toHaveBeenCalledWith({
+        decision: "send-back",
+        note: "Missing changelog",
+      });
+    });
+    fireEvent.click(
+      interaction.getByRole("button", { name: "Approve DONE" }),
+    );
+    await vi.waitFor(() => {
+      expect(submit).toHaveBeenCalledWith({
+        decision: "approve",
+        note: "Missing changelog",
+      });
+    });
+    interaction.lifecycle.unmount();
+  });
 });
