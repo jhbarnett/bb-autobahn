@@ -342,23 +342,28 @@ function AutobahnCard({
   );
 }
 
+function snoozeDurationLabel(hours: number) {
+  if (hours % 24 === 0) {
+    const days = hours / 24;
+    return days === 1 ? "1 day" : `${days} days`;
+  }
+  return hours === 1 ? "1 hour" : `${hours} hours`;
+}
+
 function RoadmapCard({
   item,
   snoozing,
+  snoozeHours,
   onSnooze,
 }: {
   item: RoadmapItem;
   snoozing: boolean;
+  snoozeHours: number;
   onSnooze: (itemKey: string, wakeAt: number) => void;
 }) {
   const navigate = useBbNavigate();
-  const [showSnooze, setShowSnooze] = useState(false);
-  const [customWake, setCustomWake] = useState("");
   const priority = item.priority <= 3 ? `P${item.priority}` : null;
-  const snoozeFor = (durationMs: number) => {
-    setShowSnooze(false);
-    onSnooze(item.id, Date.now() + durationMs);
-  };
+  const snoozeLabel = snoozeDurationLabel(snoozeHours);
   const title = (
     <span className="line-clamp-2 text-left text-xs font-semibold leading-4 text-card-foreground">
       {item.title}
@@ -387,19 +392,6 @@ function RoadmapCard({
             {title}
           </a>
         )}
-        <button
-          type="button"
-          disabled={snoozing}
-          aria-label={`Snooze ${item.title}`}
-          onClick={() => setShowSnooze((current) => !current)}
-          className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-50"
-        >
-          <Icon
-            name={snoozing ? "Spinner" : "Clock"}
-            className={cn("size-3.5", snoozing && "animate-spin")}
-            aria-hidden="true"
-          />
-        </button>
         <Icon name="Github" className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
       </div>
       <div className="mt-1.5 flex items-center gap-1.5 text-[10px] text-muted-foreground">
@@ -415,46 +407,22 @@ function RoadmapCard({
         <a href={item.url} target="_blank" rel="noreferrer" className="truncate hover:underline">
           {item.repo}#{item.number}
         </a>
-        {item.linkedThreadId ? <span className="ml-auto">Thread linked</span> : null}
+        {item.linkedThreadId ? <span>Thread linked</span> : null}
+        <button
+          type="button"
+          disabled={snoozing}
+          title={`Snooze for ${snoozeLabel}`}
+          aria-label={`Snooze ${item.title} for ${snoozeLabel}`}
+          onClick={() => onSnooze(item.id, Date.now() + snoozeHours * 60 * 60 * 1_000)}
+          className="ml-auto shrink-0 rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-50"
+        >
+          <Icon
+            name={snoozing ? "Spinner" : "Clock"}
+            className={cn("size-3.5", snoozing && "animate-spin")}
+            aria-hidden="true"
+          />
+        </button>
       </div>
-      {showSnooze ? (
-        <div className="mt-2 space-y-1.5 border-t border-border pt-1.5 text-[10px]">
-          <div className="flex gap-1">
-            <Button size="sm" variant="outline" className="h-6 px-1.5 text-[10px]" onClick={() => snoozeFor(24 * 60 * 60 * 1_000)}>
-              1 day
-            </Button>
-            <Button size="sm" variant="outline" className="h-6 px-1.5 text-[10px]" onClick={() => snoozeFor(3 * 24 * 60 * 60 * 1_000)}>
-              3 days
-            </Button>
-            <Button size="sm" variant="outline" className="h-6 px-1.5 text-[10px]" onClick={() => snoozeFor(7 * 24 * 60 * 60 * 1_000)}>
-              1 week
-            </Button>
-          </div>
-          <div className="flex gap-1">
-            <input
-              type="datetime-local"
-              value={customWake}
-              aria-label={`Custom wake time for ${item.title}`}
-              onChange={(event) => setCustomWake(event.target.value)}
-              className="min-w-0 flex-1 rounded border border-border bg-background px-1 py-0.5 text-[10px]"
-            />
-            <Button
-              size="sm"
-              className="h-6 px-1.5 text-[10px]"
-              disabled={!customWake}
-              onClick={() => {
-                const wakeAt = new Date(customWake).getTime();
-                if (Number.isFinite(wakeAt)) {
-                  setShowSnooze(false);
-                  onSnooze(item.id, wakeAt);
-                }
-              }}
-            >
-              Apply
-            </Button>
-          </div>
-        </div>
-      ) : null}
     </article>
   );
 }
@@ -465,6 +433,7 @@ function LaneSection({
   movingThreadId,
   clearingOverrideId,
   snoozingItemId,
+  snoozeHours,
   snoozedCount,
   clearingClosed,
   onMove,
@@ -477,6 +446,7 @@ function LaneSection({
   movingThreadId: string | null;
   clearingOverrideId: string | null;
   snoozingItemId: string | null;
+  snoozeHours: number;
   snoozedCount: number;
   clearingClosed: boolean;
   onMove: (threadId: string, status: BoardStatus) => void;
@@ -595,6 +565,7 @@ function LaneSection({
                   key={item.id}
                   item={item}
                   snoozing={snoozingItemId === item.id}
+                  snoozeHours={snoozeHours}
                   onSnooze={onSnoozeRoadmap}
                 />
               ))}
@@ -626,7 +597,18 @@ function LaneSection({
 
 function AutobahnBoard() {
   const rpc = useRpc<typeof rpcContract>();
+  const settings = useSettings();
   const connectionState = useRealtimeConnectionState();
+  const snoozeHoursRaw = Number.parseInt(
+    typeof settings.values?.snoozeHours === "string"
+      ? settings.values.snoozeHours
+      : "",
+    10,
+  );
+  const snoozeHours =
+    Number.isSafeInteger(snoozeHoursRaw) && snoozeHoursRaw > 0
+      ? snoozeHoursRaw
+      : 24;
   const [board, setBoard] = useState<BoardResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -860,6 +842,7 @@ function AutobahnBoard() {
             movingThreadId={movingThreadId}
             clearingOverrideId={clearingOverrideId}
             snoozingItemId={snoozingItemId}
+            snoozeHours={snoozeHours}
             snoozedCount={lane.status === "OPEN" ? (board?.snoozedCount ?? 0) : 0}
             clearingClosed={clearingClosed}
             onMove={moveCard}

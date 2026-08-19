@@ -626,6 +626,13 @@ export default function plugin(bb: BbPluginApi) {
       label: "Roadmap ranking (balanced | priority | recency)",
       default: "balanced",
     },
+    snoozeHours: {
+      type: "string",
+      label: "Default snooze (hours)",
+      description:
+        "How long the one-click snooze on an Open roadmap card hides the item.",
+      default: "24",
+    },
     boardSidebar: {
       type: "boolean",
       label: "Board sidebar",
