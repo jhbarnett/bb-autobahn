@@ -7,6 +7,7 @@ import {
   WORKFLOW_GATES,
   WORKFLOW_PHASES,
   WORKFLOW_STATE_MIGRATIONS,
+  createRoadmapSnoozeStore,
   createWorkflowStateStore,
   type CardWorkflowState,
   type JsonObject,
@@ -88,9 +89,21 @@ const DRIVER_TITLE = "Autobahn Driver";
 const DRIVER_THREAD_KEY = "autobahn-driver-thread-id";
 const WITNESS_FINGERPRINT_KEY = "witness-last-fingerprint";
 const WITNESS_PROBE_TITLE = "Autobahn witness probe";
-const ROADMAP_SNOOZES_KEY = "roadmap-snoozes";
+const LEGACY_ROADMAP_SNOOZES_KEY = "roadmap-snoozes";
 const CLOSED_DISMISSALS_KEY = "closed-card-dismissals";
 const MAX_SNOOZE_MS = 366 * 24 * 60 * 60 * 1_000;
+const HAND_RAISE_LABELS = new Set([
+  "blocked",
+  "needs-input",
+  "needs input",
+  "question",
+  "blocking-question",
+  "blocking question",
+  "failed",
+  "failing",
+  "checks-failed",
+  "attention",
+]);
 const DRIVER_PROMPT =
   "You are the policy-driven Driver for this Autobahn board. Briefly introduce yourself and offer to inventory work, establish plan contracts and gates, dispatch within WIP, run fresh-context planning and verification, park or wake work, and surface witness findings. Inspect the board before making claims. Never bypass a human gate, stop, or archive a session unless the user asks.";
 
@@ -494,6 +507,30 @@ export default function plugin(bb: BbPluginApi) {
   const database = bb.storage.database();
   bb.storage.migrate(database, [...WORKFLOW_STATE_MIGRATIONS]);
   const workflowStore = createWorkflowStateStore(database);
+  const roadmapSnoozeStore = createRoadmapSnoozeStore(database);
+  const legacySnoozeImport = (async () => {
+    const stored = await bb.storage.kv.get<Record<string, unknown>>(
+      LEGACY_ROADMAP_SNOOZES_KEY,
+    );
+    if (!stored) return;
+    const importedAt = Date.now();
+    for (const [itemKey, wakeAt] of Object.entries(stored)) {
+      if (
+        roadmapItemKeySchema.safeParse(itemKey).success &&
+        typeof wakeAt === "number" &&
+        Number.isSafeInteger(wakeAt) &&
+        wakeAt > importedAt &&
+        !roadmapSnoozeStore.get(itemKey)
+      ) {
+        roadmapSnoozeStore.snooze({
+          itemKey,
+          snoozedUntil: wakeAt,
+          snoozedAt: importedAt,
+        });
+      }
+    }
+    await bb.storage.kv.delete(LEGACY_ROADMAP_SNOOZES_KEY);
+  })().catch(() => undefined);
   const isolatedChildThreadIds = new Set(
     workflowStore
       .listEvents()
@@ -511,26 +548,40 @@ export default function plugin(bb: BbPluginApi) {
     );
   }
 
-  async function readRoadmapSnoozes() {
-    const stored =
-      (await bb.storage.kv.get<Record<string, unknown>>(ROADMAP_SNOOZES_KEY)) ??
-      {};
+  function roadmapItemRaisesHand(item: GithubItem) {
+    if (issuePriority(item.labels) === 0) return true;
+    return item.labels.some((label) =>
+      HAND_RAISE_LABELS.has(label.trim().toLowerCase()),
+    );
+  }
+
+  async function activeRoadmapSnoozes(snapshot: GithubSnapshot) {
+    await legacySnoozeImport;
     const now = Date.now();
+    const itemByKey = new Map(
+      snapshot.items.map((item) => [githubItemKey(item), item]),
+    );
     const active: Record<string, number> = {};
-    let changed = false;
-    for (const [itemKey, wakeAt] of Object.entries(stored)) {
-      if (
-        roadmapItemKeySchema.safeParse(itemKey).success &&
-        typeof wakeAt === "number" &&
-        Number.isSafeInteger(wakeAt) &&
-        wakeAt > now
-      ) {
-        active[itemKey] = wakeAt;
-      } else {
-        changed = true;
+    for (const snooze of roadmapSnoozeStore.list()) {
+      if (snooze.snoozedUntil <= now) {
+        roadmapSnoozeStore.wake(snooze.itemKey);
+        continue;
       }
+      const item = itemByKey.get(snooze.itemKey);
+      if (
+        item &&
+        !(snapshot.links[snooze.itemKey]?.length) &&
+        roadmapItemRaisesHand(item)
+      ) {
+        roadmapSnoozeStore.wake(snooze.itemKey);
+        bb.realtime.publish("board-changed", {
+          itemKey: snooze.itemKey,
+          event: "roadmap.woken-early",
+        });
+        continue;
+      }
+      active[snooze.itemKey] = snooze.snoozedUntil;
     }
-    if (changed) await bb.storage.kv.set(ROADMAP_SNOOZES_KEY, active);
     return active;
   }
 
@@ -1424,7 +1475,6 @@ export default function plugin(bb: BbPluginApi) {
       threads,
       configured,
       githubSnapshot,
-      roadmapSnoozes,
       closedDismissals,
     ] = await Promise.all([
         ensureSections(),
@@ -1432,9 +1482,9 @@ export default function plugin(bb: BbPluginApi) {
         listThreads(projectId),
         settings.get(),
         loadGithubSnapshot(),
-        readRoadmapSnoozes(),
         readClosedDismissals(),
       ]);
+    const roadmapSnoozes = await activeRoadmapSnoozes(githubSnapshot);
     const activeClosedIds = new Set(
       threads
         .filter((thread) => thread.sectionId === sections.CLOSED)
@@ -2331,9 +2381,12 @@ export default function plugin(bb: BbPluginApi) {
     if (!item) {
       throw new Error("Only an open, unstarted roadmap issue can be snoozed.");
     }
-    const snoozes = await readRoadmapSnoozes();
-    snoozes[itemKey] = wakeAt;
-    await bb.storage.kv.set(ROADMAP_SNOOZES_KEY, snoozes);
+    await legacySnoozeImport;
+    roadmapSnoozeStore.snooze({
+      itemKey,
+      snoozedUntil: wakeAt,
+      snoozedAt: now,
+    });
     bb.realtime.publish("board-changed", {
       itemKey,
       wakeAt,
@@ -2342,9 +2395,8 @@ export default function plugin(bb: BbPluginApi) {
   }
 
   async function wakeRoadmapItem(itemKey: string) {
-    const snoozes = await readRoadmapSnoozes();
-    delete snoozes[itemKey];
-    await bb.storage.kv.set(ROADMAP_SNOOZES_KEY, snoozes);
+    await legacySnoozeImport;
+    roadmapSnoozeStore.wake(itemKey);
     bb.realtime.publish("board-changed", {
       itemKey,
       event: "roadmap.woken",

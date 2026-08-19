@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   WORKFLOW_STATE_MIGRATIONS,
+  createRoadmapSnoozeStore,
   createWorkflowStateStore,
   type CardWorkflowStore,
   type PlanContract,
@@ -267,5 +268,70 @@ describe("workflow state store", () => {
         createdAt: -1,
       }),
     ).toThrow("createdAt must be a nonnegative safe integer");
+  });
+});
+
+describe("roadmap snooze store", () => {
+  it("snoozes, lists, and wakes roadmap items with validated timestamps", () => {
+    const { db } = trackedSetup();
+    const snoozes = createRoadmapSnoozeStore(db);
+
+    expect(snoozes.get("issue:acme/repo#1")).toBeNull();
+    expect(
+      snoozes.snooze({
+        itemKey: "issue:acme/repo#1",
+        snoozedUntil: 2_000,
+        snoozedAt: 1_000,
+      }),
+    ).toEqual({
+      itemKey: "issue:acme/repo#1",
+      snoozedUntil: 2_000,
+      snoozedAt: 1_000,
+    });
+    snoozes.snooze({
+      itemKey: "issue:acme/repo#2",
+      snoozedUntil: 1_500,
+      snoozedAt: 1_000,
+    });
+    expect(snoozes.list().map((snooze) => snooze.itemKey)).toEqual([
+      "issue:acme/repo#2",
+      "issue:acme/repo#1",
+    ]);
+
+    snoozes.snooze({
+      itemKey: "issue:acme/repo#1",
+      snoozedUntil: 3_000,
+      snoozedAt: 2_500,
+    });
+    expect(snoozes.get("issue:acme/repo#1")).toEqual({
+      itemKey: "issue:acme/repo#1",
+      snoozedUntil: 3_000,
+      snoozedAt: 2_500,
+    });
+
+    expect(snoozes.wake("issue:acme/repo#1")).toBe(true);
+    expect(snoozes.wake("issue:acme/repo#1")).toBe(false);
+    expect(() =>
+      snoozes.snooze({
+        itemKey: "issue:acme/repo#3",
+        snoozedUntil: -1,
+        snoozedAt: 0,
+      }),
+    ).toThrow("snoozedUntil must be a nonnegative safe integer");
+  });
+
+  it("persists snoozes across store instances on the same database", () => {
+    const { db } = trackedSetup();
+    createRoadmapSnoozeStore(db).snooze({
+      itemKey: "issue:acme/repo#7",
+      snoozedUntil: 9_000,
+      snoozedAt: 4_000,
+    });
+
+    expect(createRoadmapSnoozeStore(db).get("issue:acme/repo#7")).toEqual({
+      itemKey: "issue:acme/repo#7",
+      snoozedUntil: 9_000,
+      snoozedAt: 4_000,
+    });
   });
 });

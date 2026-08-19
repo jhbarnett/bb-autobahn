@@ -251,6 +251,147 @@ describe("autobahn backend", () => {
     dateNow.mockRestore();
   });
 
+  it("wakes a snoozed roadmap issue early when it raises its hand", async () => {
+    const now = Date.now();
+    const dateNow = vi.spyOn(Date, "now").mockReturnValue(now);
+    const sections = ["OPEN", "WIP", "R4R", "CLOSED"].map((name) => ({
+      id: `section-${name}`,
+      name,
+      createdAt: 1,
+      updatedAt: 1,
+    }));
+    const issue = {
+      repo: "acme/repo",
+      number: 42,
+      kind: "issue",
+      title: "Future work",
+      state: "open",
+      author: "agent",
+      labels: [] as string[],
+      assignees: [],
+      url: "https://github.com/acme/repo/issues/42",
+      body: "",
+      updatedAt: "2026-08-19T00:00:00Z",
+    };
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "autobahn",
+      agentSkillIds: ["autobahn-driver"],
+      sdk: {
+        plugins: {
+          callRpc: async ({ method }) => {
+            if (method === "listItems") return { items: [issue] };
+            if (method === "listLinks") return { links: {} };
+            if (method === "status") {
+              return {
+                ghOk: true,
+                ghError: null,
+                repos: [{ repo: "acme/repo", projectId: "project-1" }],
+                lastSyncedAt: "2026-08-19T00:00:00Z",
+              };
+            }
+            throw new Error("Unexpected GitHub RPC " + method);
+          },
+        },
+        threadSections: {
+          list: () => sections,
+          create: ({ name }) => ({
+            id: `section-${name}`,
+            name,
+            createdAt: 1,
+            updatedAt: 1,
+          }),
+        },
+        projects: { list: () => [] },
+        threads: { list: () => [] },
+      },
+    });
+    plugin(bb);
+
+    await harness.behavior.callRpc("snoozeRoadmapItem", {
+      itemKey: "issue:acme/repo#42",
+      wakeAt: now + 7 * 24 * 60 * 60 * 1_000,
+    });
+    const snoozed = await harness.behavior.callRpc("listBoard", {});
+    expect(snoozed.roadmapItems).toHaveLength(0);
+    expect(snoozed.snoozedCount).toBe(1);
+
+    issue.labels = ["blocked"];
+    dateNow.mockReturnValue(now + 31_000);
+    const woken = await harness.behavior.callRpc("listBoard", {});
+    expect(woken.roadmapItems).toHaveLength(1);
+    expect(woken.snoozedCount).toBe(0);
+    dateNow.mockRestore();
+  });
+
+  it("persists roadmap snoozes in the plugin database across reloads", async () => {
+    const now = Date.now();
+    const dateNow = vi.spyOn(Date, "now").mockReturnValue(now);
+    const sections = ["OPEN", "WIP", "R4R", "CLOSED"].map((name) => ({
+      id: `section-${name}`,
+      name,
+      createdAt: 1,
+      updatedAt: 1,
+    }));
+    const issue = {
+      repo: "acme/repo",
+      number: 42,
+      kind: "issue",
+      title: "Future work",
+      state: "open",
+      author: "agent",
+      labels: [],
+      assignees: [],
+      url: "https://github.com/acme/repo/issues/42",
+      body: "",
+      updatedAt: "2026-08-19T00:00:00Z",
+    };
+    const sdk = {
+      plugins: {
+        callRpc: async ({ method }: { method: string }) => {
+          if (method === "listItems") return { items: [issue] };
+          if (method === "listLinks") return { links: {} };
+          if (method === "status") {
+            return {
+              ghOk: true,
+              ghError: null,
+              repos: [{ repo: "acme/repo", projectId: "project-1" }],
+              lastSyncedAt: "2026-08-19T00:00:00Z",
+            };
+          }
+          throw new Error("Unexpected GitHub RPC " + method);
+        },
+      },
+      threadSections: {
+        list: () => sections,
+        create: ({ name }: { name: string }) => ({
+          id: `section-${name}`,
+          name,
+          createdAt: 1,
+          updatedAt: 1,
+        }),
+      },
+      projects: { list: () => [] },
+      threads: { list: () => [] },
+    };
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "autobahn",
+      agentSkillIds: ["autobahn-driver"],
+      sdk,
+    });
+    plugin(bb);
+
+    await harness.behavior.callRpc("snoozeRoadmapItem", {
+      itemKey: "issue:acme/repo#42",
+      wakeAt: now + 24 * 60 * 60 * 1_000,
+    });
+
+    const reloaded = await harness.lifecycle.reload(plugin);
+    const board = await reloaded.harness.behavior.callRpc("listBoard", {});
+    expect(board.roadmapItems).toHaveLength(0);
+    expect(board.snoozedCount).toBe(1);
+    dateNow.mockRestore();
+  });
+
   it("clears Closed cards without archiving and refreshes on archive", async () => {
     const sections = ["OPEN", "WIP", "R4R", "CLOSED"].map((name) => ({
       id: `section-${name}`,
