@@ -511,6 +511,7 @@ describe("autobahn backend", () => {
       untilEpochMs: 0,
       nextAction: "Wait for the timer",
     });
+    expect(row.sectionId).toBe("section-OPEN");
     expect(stop).toHaveBeenCalledWith({ threadId: "thread-1" });
     await harness.behavior.runSchedule("wake-cards");
 

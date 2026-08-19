@@ -136,6 +136,11 @@ describe("autobahn panel", () => {
     expect(slot.getByText("Ship feature")).toBeTruthy();
     expect(slot.getByText("Top roadmap issue")).toBeTruthy();
     expect(slot.getByRole("link", { name: "acme/repo#42" })).toBeTruthy();
+    expect(slot.getByLabelText("Card state colors")).toBeTruthy();
+    expect(
+      slot.getByLabelText("Card state: Needs human attention"),
+    ).toBeTruthy();
+    expect(slot.getByLabelText("Card state: Idle or queued")).toBeTruthy();
     expect(slot.queryByText("codex")).toBeNull();
     expect(
       slot.container.querySelector('[data-icon="ChatGPT"]'),
@@ -187,6 +192,49 @@ describe("autobahn panel", () => {
         status: "R4R",
       });
     });
+    slot.lifecycle.unmount();
+  });
+
+  it("shows parked work in Open with the waiting corner tick", async () => {
+    const parkedBoard = structuredClone(board);
+    const parkedCard = parkedBoard.lanes[1]!.cards.shift()!;
+    parkedCard.status = "OPEN";
+    parkedCard.runtimeStatus = "idle";
+    parkedCard.workflow.gate = "none";
+    parkedCard.workflow.exitStatus = "DONE";
+    parkedCard.workflow.parkedWake = {
+      kind: "timer",
+      ref: null,
+      until: 100,
+    };
+    parkedCard.attention = [];
+    parkedBoard.lanes[0]!.cards.push(parkedCard);
+
+    const app = await loadPluginApp(() => import("./app"));
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "" },
+      {
+        rpc: {
+          listBoard: () => parkedBoard,
+          moveThread: ({ threadId, status }) => ({
+            threadId,
+            status,
+            warning: null,
+          }),
+          getDriver: () => ({ threadId: "driver-thread" }),
+          clearStatusOverride: () => ({ ok: true as const }),
+        },
+      },
+    );
+
+    expect(
+      await slot.findByLabelText("Card state: Parked or waiting"),
+    ).toBeTruthy();
+    const openLane = slot.getByRole("heading", { name: "OPEN" }).closest(
+      "section",
+    );
+    expect(openLane?.textContent).toContain("Ship feature");
     slot.lifecycle.unmount();
   });
 

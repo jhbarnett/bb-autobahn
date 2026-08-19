@@ -13,9 +13,12 @@ The board uses bb thread sections as its coarse state:
 3. `R4R`
 4. `CLOSED`
 
-Open is both the task list and the start of the thread workflow. Autobahn reads
-open issues from the installed GitHub plugin, ranks common P0 through P3 labels
-ahead of unlabeled work, and shows the configured top five issues by default.
+The lanes describe ownership rather than every operational detail: Open is queued,
+forthcoming, or parked work; WIP is work allocated to an agent; R4R is verified
+work awaiting a human decision; Closed is accepted or externally completed work.
+Autobahn reads open issues from the installed GitHub plugin, ranks common P0
+through P3 labels ahead of unlabeled work, and shows the configured top five
+issues by default.
 Open controller threads render as ordinary cards; the compact roadmap cards are
 reserved for unstarted issues, link to GitHub, and can be turned into stopped
 Open sessions by the Driver.
@@ -30,9 +33,12 @@ PR never has to mean the thread is finished. The small `Auto` control on an
 overridden card, or the Driver clear-override tool, restores external automation
 and immediately reconciles the current GitHub state.
 
-Workflow metadata is orthogonal to those sections. Cards show phase, gate, risk,
-priority, evidence and concern counts, one required `Next:` action, native bb or
-PR attention, project, harness logo, model, context usage, and external links.
+Workflow metadata is orthogonal to those sections. A color-coded corner tick
+shows the live operational state: muted for idle or queued, primary for an active
+agent, warning for parked, ring-color for human attention, destructive for blocked
+or failed, and success for complete. Cards also show phase, gate, risk, priority,
+evidence and concern counts, one required `Next:` action, native bb or PR
+attention, project, harness logo, model, context usage, and external links.
 The Needs You filter isolates blocked, approval, review, runtime, staleness, and
 consistency signals. WIP and R4R limits are soft settings: the UI warns and the
 Driver dispatches only into available capacity.
@@ -52,7 +58,8 @@ Driver dispatches only into available capacity.
   every finding. Rejected findings are dropped.
 - Successful build work advances to verification, not directly to Closed.
 - Parking supports timers, dependencies, pending interactions, PR merges, and
-  check completion. Parked cards do not consume WIP.
+  check completion. Parking moves the card to Open without discarding its workflow
+  phase, and it can be dispatched back to WIP after waking.
 - A scheduled wake pass surfaces satisfied conditions. A witness pass reports
   stale or inconsistent work and never kills it.
 - Current workflow state, manual status provenance, and an append-only event

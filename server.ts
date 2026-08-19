@@ -253,6 +253,7 @@ interface MoveOptions {
   reason?: string;
   setOverride?: boolean;
   bypassWorkflowGuards?: boolean;
+  preserveWorkflowPosition?: boolean;
 }
 
 function normalizeSummary(text: string | null): string | null {
@@ -820,8 +821,9 @@ export default function plugin(bb: BbPluginApi) {
       ? null
       : await moveWarning(threadId, status, sections);
     await bb.sdk.threads.update({ threadId, sectionId: sections[status] });
-    const phase =
-      status === "WIP"
+    const phase = options.preserveWorkflowPosition
+      ? current?.phase ?? "intake"
+      : status === "WIP"
         ? "build"
         : status === "R4R"
           ? "egress"
@@ -830,7 +832,9 @@ export default function plugin(bb: BbPluginApi) {
             : "intake";
     workflowStore.upsert(threadId, {
       phase,
-      completedAt: status === "CLOSED" ? Date.now() : null,
+      ...(options.preserveWorkflowPosition
+        ? {}
+        : { completedAt: status === "CLOSED" ? Date.now() : null }),
       ...(options.setOverride
         ? {
             statusOverride: status,
@@ -2489,9 +2493,14 @@ export default function plugin(bb: BbPluginApi) {
           blockedBy: [...new Set([...state.blockedBy, ref])],
         });
       }
+      await moveThread(threadId, "OPEN", {
+        source: "automation",
+        reason: `Parked until ${kind} is satisfied`,
+        bypassWorkflowGuards: true,
+        preserveWorkflowPosition: true,
+      });
       await bb.sdk.threads.stop({ threadId });
-      bb.realtime.publish("board-changed", { threadId, event: "card.parked" });
-      return `Parked ${threadId} until ${kind} is satisfied. Next: ${nextAction}`;
+      return `Parked ${threadId} in OPEN until ${kind} is satisfied. Next: ${nextAction}`;
     },
   });
 

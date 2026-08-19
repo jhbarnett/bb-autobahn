@@ -17,7 +17,7 @@ Use deterministic Autobahn tools for coordination and models for bounded judgmen
 8. Use `autobahn_run_verification` before declaring code ready for human review.
 9. Let linked GitHub issue and pull-request state drive Closed by default. Use `autobahn_move_card` only when the user explicitly wants a durable override, and record the reason.
 10. Use `autobahn_clear_status_override` when automatic external-state reconciliation should resume.
-11. Park work that is waiting on a timer, dependency, PR merge, or user interaction. Parked work does not consume WIP.
+11. Park work that is waiting on a timer, dependency, PR merge, or user interaction. Parking moves it to Open while preserving its workflow phase; wake it before dispatching it back to WIP.
 12. Use the witness tool to surface stale or inconsistent work. Recommend action; never auto-kill.
 13. Stop or archive sessions only with explicit user intent.
 

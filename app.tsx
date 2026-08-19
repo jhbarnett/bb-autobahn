@@ -45,13 +45,6 @@ const STATUS_LABELS: Record<BoardStatus, string> = {
   CLOSED: "Closed",
 };
 
-const STATUS_DOT: Record<BoardStatus, string> = {
-  OPEN: "bg-muted-foreground/60",
-  WIP: "bg-primary",
-  R4R: "bg-foreground",
-  CLOSED: "bg-primary/70",
-};
-
 function contextPercent(card: Card) {
   if (!card.context) return null;
   const percent = Math.min(
@@ -89,6 +82,112 @@ function compactLinkLabel(card: Card, label: string) {
   return label;
 }
 
+type CardState =
+  | "idle"
+  | "active"
+  | "parked"
+  | "attention"
+  | "blocked"
+  | "complete";
+
+const CARD_STATE: Record<
+  CardState,
+  { label: string; borderClass: string; swatchClass: string }
+> = {
+  idle: {
+    label: "Idle or queued",
+    borderClass: "border-muted-foreground/50",
+    swatchClass: "bg-muted-foreground/50",
+  },
+  active: {
+    label: "Agent active",
+    borderClass: "border-primary",
+    swatchClass: "bg-primary",
+  },
+  parked: {
+    label: "Parked or waiting",
+    borderClass: "border-[var(--warning)]",
+    swatchClass: "bg-[var(--warning)]",
+  },
+  attention: {
+    label: "Needs human attention",
+    borderClass: "border-[var(--attention)]",
+    swatchClass: "bg-[var(--attention)]",
+  },
+  blocked: {
+    label: "Blocked or failed",
+    borderClass: "border-destructive",
+    swatchClass: "bg-destructive",
+  },
+  complete: {
+    label: "Complete",
+    borderClass: "border-[var(--success)]",
+    swatchClass: "bg-[var(--success)]",
+  },
+};
+
+function cardState(card: Card): CardState {
+  if (
+    card.runtimeStatus === "error" ||
+    card.workflow.exitStatus === "BLOCKED" ||
+    ["blocked", "checks-failed", "changes-requested"].includes(
+      card.workflow.gate,
+    )
+  ) {
+    return "blocked";
+  }
+  if (card.workflow.parkedWake) return "parked";
+  if (
+    card.status === "R4R" ||
+    ["needs-input", "plan-approval", "review-requested"].includes(
+      card.workflow.gate,
+    )
+  ) {
+    return "attention";
+  }
+  if (["active", "starting"].includes(card.runtimeStatus)) return "active";
+  if (card.status === "CLOSED" || card.workflow.phase === "complete") {
+    return "complete";
+  }
+  return "idle";
+}
+
+function CardStateTick({ state }: { state: CardState }) {
+  const presentation = CARD_STATE[state];
+  return (
+    <span
+      role="img"
+      aria-label={`Card state: ${presentation.label}`}
+      title={presentation.label}
+      className={cn(
+        "pointer-events-none absolute right-0 top-0 size-4 rounded-tr-lg border-r-[3px] border-t-[3px]",
+        presentation.borderClass,
+      )}
+    />
+  );
+}
+
+function StateLegend() {
+  return (
+    <div
+      aria-label="Card state colors"
+      className="flex flex-wrap items-center gap-x-3 gap-y-1 px-1 text-[10px] text-muted-foreground"
+    >
+      {(Object.entries(CARD_STATE) as Array<[CardState, (typeof CARD_STATE)[CardState]]>).map(
+        ([state, presentation]) => (
+          <span key={state} className="inline-flex items-center gap-1">
+            <span
+              className={cn("size-2 rounded-sm", presentation.swatchClass)}
+              aria-hidden="true"
+            />
+            {presentation.label}
+          </span>
+        ),
+      )}
+    </div>
+  );
+}
+
 function AutobahnCard({
   card,
   moving,
@@ -111,10 +210,11 @@ function AutobahnCard({
         event.dataTransfer.setData("text/plain", card.id);
       }}
       className={cn(
-        "group flex w-60 shrink-0 cursor-grab flex-col rounded-lg border border-border bg-card shadow-sm transition-shadow hover:shadow-md active:cursor-grabbing",
+        "group relative flex w-60 shrink-0 cursor-grab flex-col rounded-lg border border-border bg-card shadow-sm transition-shadow hover:shadow-md active:cursor-grabbing",
         moving && "pointer-events-none opacity-60",
       )}
     >
+      <CardStateTick state={cardState(card)} />
       <header className="px-2.5 py-2">
         <div className="flex items-start gap-1.5">
           <button
@@ -125,18 +225,6 @@ function AutobahnCard({
             {card.title}
           </button>
           <WorkflowGateBadge gate={card.workflow.gate} />
-          <span
-            className={cn(
-              "mt-1 size-1.5 shrink-0 rounded-full",
-              card.runtimeStatus === "error"
-                ? "bg-destructive"
-                : card.runtimeStatus === "active"
-                  ? "bg-primary"
-                  : "bg-muted-foreground/50",
-            )}
-            title={card.runtimeStatus}
-            aria-label={`Thread status: ${card.runtimeStatus}`}
-          />
           <Icon
             name="DragDropVertical"
             className="size-3.5 shrink-0 text-muted-foreground/60 group-hover:text-muted-foreground"
@@ -259,7 +347,8 @@ function RoadmapCard({ item }: { item: RoadmapItem }) {
   );
 
   return (
-    <article className="flex w-60 shrink-0 flex-col rounded-lg border border-dashed border-border bg-muted/30 px-2.5 py-2 shadow-sm">
+    <article className="relative flex w-60 shrink-0 flex-col rounded-lg border border-dashed border-border bg-muted/30 px-2.5 py-2 shadow-sm">
+      <CardStateTick state="idle" />
       <div className="flex items-start gap-1.5">
         {item.linkedThreadId ? (
           <button
@@ -337,7 +426,6 @@ function LaneSection({
       )}
     >
       <div className="flex items-center gap-2 border-b border-border px-1 pb-2">
-        <span className={cn("size-2 rounded-full", STATUS_DOT[lane.status])} />
         <h2 className="text-xs font-bold tracking-[0.16em] text-foreground">
           {lane.status}
         </h2>
@@ -543,12 +631,15 @@ function AutobahnBoard() {
   return (
     <main className="h-full overflow-y-auto bg-background p-3 md:p-4">
       <div className="mx-auto w-full max-w-[96rem] space-y-4">
-        <NeedsYouStrip
-          count={board?.needsYouCount ?? 0}
-          active={needsYouOnly}
-          reasons={attentionReasons}
-          onActiveChange={setNeedsYouOnly}
-        />
+        <div className="space-y-2">
+          <NeedsYouStrip
+            count={board?.needsYouCount ?? 0}
+            active={needsYouOnly}
+            reasons={attentionReasons}
+            onActiveChange={setNeedsYouOnly}
+          />
+          <StateLegend />
+        </div>
         {error ? (
           <div className="rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
             Refresh failed: {error}
