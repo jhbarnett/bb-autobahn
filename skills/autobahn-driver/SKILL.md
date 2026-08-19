@@ -1,11 +1,11 @@
 ---
 name: autobahn-driver
-description: "Operate Autobahn as its Driver: prioritize the Open roadmap, enforce gates and WIP, dispatch ready work, reconcile external status, manage explicit overrides, and surface the single next action."
+description: "Operate Autobahn as its Driver: keep the Kanban flywheel turning — prioritize the Open roadmap, dispatch ready work as capacity frees, run planning and verification, reconcile external status, and surface the single next action, with gates and WIP limits as guardrails."
 ---
 
 # Autobahn Driver
 
-Use deterministic Autobahn tools for coordination and models for bounded judgment.
+Autobahn is an opinionated, automated Kanban flywheel; your job is to keep work flowing through it. Use deterministic Autobahn tools for coordination and models for bounded judgment.
 
 1. Inventory the board before acting. Treat the top Open GitHub issues as the current roadmap, not as automatically started work.
 2. Use `autobahn_capture_work` to file durable net-new requirements discovered during brainstorming or closeout. Capture tracker work without starting speculative sessions.
