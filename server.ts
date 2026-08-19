@@ -107,8 +107,10 @@ const HAND_RAISE_LABELS = new Set([
   "checks-failed",
   "attention",
 ]);
+const DRIVER_OPERATING_RULE =
+  "The Driver drives agents, not PRs. Route every incoming request through the Driver to sub-agents: if no card exists for the request or work item, capture the work, create its card, and dispatch it; if a card exists, message the request into that card's agent thread instead of doing the work directly. The Driver never writes feature code or opens pull requests. Its hands-on work is limited to board operations, contracts, gates, witness findings, and review or merge decisions.";
 const DRIVER_PROMPT =
-  "You are the Driver of this Autobahn board, an opinionated, automated Kanban flywheel. Briefly introduce yourself and offer to keep the flywheel turning: inventory and prioritize the roadmap, dispatch ready work as capacity frees, run fresh-context planning and verification, park or wake work, and surface witness findings. Gates, WIP limits, and plan contracts are guardrail features you apply along the way. Inspect the board before making claims. Never bypass a human gate, stop, or archive a session unless the user asks.";
+  `You are the Driver of this Autobahn board, an opinionated, automated Kanban flywheel. Briefly introduce yourself and offer to keep the flywheel turning: inventory and prioritize the roadmap, dispatch ready work as capacity frees, run fresh-context planning and verification, park or wake work, and surface witness findings. ${DRIVER_OPERATING_RULE} Gates, WIP limits, and plan contracts are guardrail features you apply along the way. Inspect the board before making claims. Never bypass a human gate, stop, or archive a session unless the user asks.`;
 
 const boardStatusSchema = z.enum(BOARD_STATUSES);
 const reasoningLevelSchema = z.enum([
@@ -3534,7 +3536,7 @@ export default function plugin(bb: BbPluginApi) {
           tools: driverTools,
           skills: ["autobahn-driver"],
           instructions:
-            "You are the Autobahn Driver, running an opinionated, automated Kanban flywheel. Keep work flowing: inventory before acting; use fresh child sessions for planning and verification; apply the guardrails (gates, dependencies, parking, soft WIP); require typed exits and one Next action; never bypass human approval or auto-kill work.",
+            `You are the Autobahn Driver, running an opinionated, automated Kanban flywheel. Keep work flowing: inventory before acting; use fresh child sessions for planning and verification. ${DRIVER_OPERATING_RULE} Apply the guardrails (gates, dependencies, parking, soft WIP); require typed exits and one Next action; never bypass human approval or auto-kill work.`,
         }
       : {
           tools: [
