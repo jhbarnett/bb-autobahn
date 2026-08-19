@@ -1,4 +1,9 @@
-import { defineRpcContract, type BbPluginApi } from "@get-bb/plugin-sdk";
+import {
+  defineRpcContract,
+  type BbPluginApi,
+  type PluginAgentToolContext,
+  type PluginAgentToolRegistrationBase,
+} from "@get-bb/plugin-sdk";
 import { z } from "zod";
 import {
   EXIT_STATUSES,
@@ -640,6 +645,13 @@ export default function plugin(bb: BbPluginApi) {
       label: "Board sidebar",
       description:
         "Offer the Autobahn board as a sidebar thread list replacement (picked under Settings → Appearance → Sidebar). Off by default.",
+      default: false,
+    },
+    autoDispatch: {
+      type: "boolean",
+      label: "Automatic dispatch",
+      description:
+        "Fill freed WIP capacity with already-cleared ready work. Human gates and all existing dispatch guards still apply. Off by default.",
       default: false,
     },
   });
@@ -3288,7 +3300,19 @@ export default function plugin(bb: BbPluginApi) {
     },
   });
 
-  bb.agents.registerTool({
+  const dispatchReadyParameters = z
+    .object({
+      projectId: z.string().min(1),
+      maximum: z.number().int().positive().max(20).optional(),
+    })
+    .strict();
+  const dispatchReadyTool: PluginAgentToolRegistrationBase & {
+    parameters: typeof dispatchReadyParameters;
+    execute(
+      params: z.output<typeof dispatchReadyParameters>,
+      context: Pick<PluginAgentToolContext, "threadId">,
+    ): Promise<string>;
+  } = {
     name: "autobahn_dispatch_ready",
     description:
       "Deterministically fill available WIP slots with planned, approved, unblocked, unparked OPEN cards.",
@@ -3296,12 +3320,7 @@ export default function plugin(bb: BbPluginApi) {
       pending: "Dispatching ready cards",
       completed: "Dispatched ready cards",
     },
-    parameters: z
-      .object({
-        projectId: z.string().min(1),
-        maximum: z.number().int().positive().max(20).optional(),
-      })
-      .strict(),
+    parameters: dispatchReadyParameters,
     execute: async ({ projectId, maximum }, { threadId: senderThreadId }) => {
       if (dispatching) {
         throw new Error("Another deterministic dispatch is already running.");
@@ -3356,7 +3375,7 @@ export default function plugin(bb: BbPluginApi) {
               },
             ],
             mode: "auto",
-            senderThreadId,
+            ...(senderThreadId ? { senderThreadId } : {}),
           });
           workflowStore.upsert(card.id, {
             phase: "build",
@@ -3390,7 +3409,33 @@ export default function plugin(bb: BbPluginApi) {
         dispatching = false;
       }
     },
-  });
+  };
+  bb.agents.registerTool(dispatchReadyTool);
+
+  async function autoDispatchProject(projectId: string, trigger: string) {
+    const { autoDispatch } = await settings.get();
+    if (!autoDispatch) return;
+    try {
+      const result = await dispatchReadyTool.execute(
+        { projectId },
+        { threadId: "" },
+      );
+      if (!result.startsWith("Dispatched 0.")) {
+        bb.log.info(`Automatic dispatch (${trigger}): ${result}`);
+      }
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message === "Another deterministic dispatch is already running."
+      ) {
+        bb.log.debug(
+          `Automatic dispatch (${trigger}) skipped: ${error.message}`,
+        );
+        return;
+      }
+      bb.log.warn(`Automatic dispatch (${trigger}) failed: ${String(error)}`);
+    }
+  }
 
   bb.agents.registerTool({
     name: "autobahn_park_card",
@@ -3563,6 +3608,12 @@ export default function plugin(bb: BbPluginApi) {
     });
   }
 
+  for (const event of ["thread.idle", "thread.archived"] as const) {
+    bb.events.on(event, async ({ thread }) => {
+      await autoDispatchProject(thread.projectId, event);
+    });
+  }
+
   bb.events.on("thread.idle", async ({ thread }) => {
     const driverThreadId =
       await bb.storage.kv.get<string>(DRIVER_THREAD_KEY);
@@ -3620,6 +3671,15 @@ export default function plugin(bb: BbPluginApi) {
   bb.background.schedule("external-status-sync", "*/5 * * * *", async () => {
     githubSnapshotCache = null;
     await syncExternalStatuses();
+  });
+
+  bb.background.schedule("auto-dispatch", "*/15 * * * *", async () => {
+    const { autoDispatch } = await settings.get();
+    if (!autoDispatch) return;
+    const projects = await bb.sdk.projects.list({ includePersonal: true });
+    for (const project of projects) {
+      await autoDispatchProject(project.id, "schedule");
+    }
   });
 
   bb.background.schedule("witness-scan", "*/15 * * * *", async () => {

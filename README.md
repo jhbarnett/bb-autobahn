@@ -45,6 +45,7 @@ Common P0–P3 and priority labels are recognized. Captured items form a tier ah
 - Successful build exits advance to fresh-context verification, never directly to Closed.
 - Verification runs bounded parallel lenses and independently validates every proposed finding.
 - Parking moves work to Open without discarding its workflow phase. Timer, dependency, interaction, PR, and checks-based wake conditions are supported.
+- Optional unattended dispatch fills freed per-project WIP capacity after thread lifecycle events, with a 15-minute backstop. It only pulls already-planned work that passes the same gates, dependencies, parking, and soft-limit checks as Driver dispatch.
 - Linked issue and PR state reconciles Closed automatically. Reopened verified work returns to R4R; other reopened work returns to Open.
 - User or Driver moves create durable overrides. The card’s **Auto** control restores external-state reconciliation.
 
@@ -81,6 +82,7 @@ The steering-wheel button opens a persistent Driver thread in a right-side panel
 | `roadmapLimit` | `5` | Maximum unstarted roadmap issues |
 | `roadmapRanking` | `balanced` | `balanced`, `priority`, or `recency` |
 | `snoozeHours` | `24` | One-click roadmap snooze duration (hours) |
+| `autoDispatch` | `false` | Fill freed WIP capacity with already-cleared ready work |
 
 Configure values through **Extensions → Plugins → Autobahn** or `bb plugin config autobahn set <key> <value>`.
 

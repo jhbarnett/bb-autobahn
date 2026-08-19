@@ -1961,4 +1961,303 @@ describe("autobahn backend", () => {
       expect(shippedSkillIds).toContain(skillId);
     }
   });
+  it("auto-dispatches on freed-capacity events and schedule without bypassing guards", async () => {
+    const sections = ["OPEN", "WIP", "R4R", "CLOSED"].map((name) => ({
+      id: "section-" + name,
+      name,
+      createdAt: 1,
+      updatedAt: 1,
+    }));
+    const makeRow = (
+      id: string,
+      updatedAt: number,
+      hasPendingInteraction = false,
+    ) => ({
+      id,
+      projectId: "project-1",
+      environmentId: null,
+      providerId: "codex",
+      title: id,
+      titleFallback: null,
+      sectionId: "section-OPEN",
+      status: "idle" as const,
+      hasPendingInteraction,
+      environmentBranchName: "agent/" + id,
+      updatedAt,
+    });
+    const rows = [
+      makeRow("ready-idle", 1),
+      makeRow("ready-archive", 2),
+      makeRow("ready-schedule", 3),
+      makeRow("no-plan", 4),
+      makeRow("open-gate", 5),
+      makeRow("pending-interaction", 6, true),
+      makeRow("blocked-dependency", 7),
+      makeRow("parked", 8),
+    ];
+    const send = vi.fn(() => ({ ok: true }));
+    const stop = vi.fn(() => ({ ok: true }));
+    const update = vi.fn(({ threadId, sectionId }) => {
+      const row = rows.find((candidate) => candidate.id === threadId);
+      if (row && sectionId) row.sectionId = sectionId;
+      return row;
+    });
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "autobahn",
+      agentSkillIds: ["autobahn-driver"],
+      settings: { autoDispatch: true, wipLimit: "1" },
+      sdk: {
+        threadSections: {
+          list: () => sections,
+          create: ({ name }) => ({
+            id: "section-" + name,
+            name,
+            createdAt: 1,
+            updatedAt: 1,
+          }),
+        },
+        projects: {
+          list: () => [
+            {
+              id: "project-1",
+              name: "Agentbox",
+              kind: "standard",
+              gitRemoteUrl: null,
+              createdAt: 1,
+              updatedAt: 1,
+              sources: [],
+            },
+          ],
+        },
+        threads: {
+          list: (args) =>
+            rows.filter(
+              (row) =>
+                (!args?.projectId || row.projectId === args.projectId) &&
+                (!args?.sectionId || row.sectionId === args.sectionId),
+            ),
+          get: ({ threadId }) => {
+            const row = rows.find((candidate) => candidate.id === threadId);
+            if (!row) throw new Error("Unknown thread " + threadId);
+            return { ...row, archivedAt: null, deletedAt: null };
+          },
+          update,
+          send,
+          stop,
+          defaultExecutionOptions: async () => ({
+            model: "gpt-5.6",
+            reasoningLevel: "high",
+            permissionMode: "auto",
+            serviceTier: "default",
+            source: "client/turn/start",
+          }),
+          timeline: async () => ({ rows: [] }),
+          output: async () => ({ output: "Ready." }),
+          interactions: { list: async () => [] },
+        },
+      },
+    });
+    plugin(bb);
+
+    const contract = {
+      objective: "Exercise unattended dispatch",
+      scope: ["server.ts"],
+      outOfScope: [],
+      expectedFiles: ["server.ts"],
+      acceptanceCriteria: ["Only cleared cards dispatch"],
+      verificationCommands: ["npm test"],
+    };
+    const setContract = (
+      threadId: string,
+      options: {
+        riskClass?: "low" | "high";
+        priority?: number;
+        blockedBy?: string[];
+      } = {},
+    ) =>
+      harness.behavior.callAgentTool("autobahn_set_contract", {
+        threadId,
+        riskClass: options.riskClass ?? "low",
+        priority: options.priority ?? 0,
+        blockedBy: options.blockedBy ?? [],
+        requiresHumanApproval: false,
+        contract,
+      });
+
+    await setContract("ready-idle", { priority: 0 });
+    await setContract("ready-archive", { priority: 1 });
+    await setContract("ready-schedule", { priority: 2 });
+    await setContract("open-gate", { riskClass: "high" });
+    await setContract("pending-interaction");
+    await setContract("blocked-dependency", {
+      blockedBy: ["unfinished-dependency"],
+    });
+    await setContract("parked");
+    await harness.behavior.callAgentTool("autobahn_park_card", {
+      threadId: "parked",
+      kind: "timer",
+      untilEpochMs: Date.now() + 60_000,
+      nextAction: "Wait for the timer",
+    });
+
+    await harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({
+        id: "ready-idle",
+        projectId: "project-1",
+        sectionId: "section-OPEN",
+      }),
+      lastAssistantText: "Ready.",
+    });
+    expect(send.mock.calls.map(([input]) => input.threadId)).toEqual([
+      "ready-idle",
+    ]);
+
+    rows.find((row) => row.id === "ready-idle")!.sectionId = "section-R4R";
+    await harness.behavior.emitThreadEvent("thread.archived", {
+      thread: makeThreadResponse({
+        id: "ready-idle",
+        projectId: "project-1",
+        sectionId: "section-R4R",
+      }),
+    });
+    expect(send.mock.calls.map(([input]) => input.threadId)).toEqual([
+      "ready-idle",
+      "ready-archive",
+    ]);
+
+    rows.find((row) => row.id === "ready-archive")!.sectionId = "section-R4R";
+    await harness.behavior.runSchedule("auto-dispatch");
+    expect(send.mock.calls.map(([input]) => input.threadId)).toEqual([
+      "ready-idle",
+      "ready-archive",
+      "ready-schedule",
+    ]);
+    expect(
+      rows
+        .filter((row) =>
+          [
+            "no-plan",
+            "open-gate",
+            "pending-interaction",
+            "blocked-dependency",
+            "parked",
+          ].includes(row.id),
+        )
+        .map((row) => [row.id, row.sectionId]),
+    ).toEqual([
+      ["no-plan", "section-OPEN"],
+      ["open-gate", "section-OPEN"],
+      ["pending-interaction", "section-OPEN"],
+      ["blocked-dependency", "section-OPEN"],
+      ["parked", "section-OPEN"],
+    ]);
+  });
+
+  it("keeps unattended dispatch off by default for events and schedule", async () => {
+    const sections = ["OPEN", "WIP", "R4R", "CLOSED"].map((name) => ({
+      id: "section-" + name,
+      name,
+      createdAt: 1,
+      updatedAt: 1,
+    }));
+    const row = {
+      id: "ready-card",
+      projectId: "project-1",
+      environmentId: null,
+      providerId: "codex",
+      title: "Ready card",
+      titleFallback: null,
+      sectionId: "section-OPEN",
+      status: "idle" as const,
+      hasPendingInteraction: false,
+      environmentBranchName: "agent/ready-card",
+      updatedAt: 1,
+    };
+    const send = vi.fn(() => ({ ok: true }));
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "autobahn",
+      agentSkillIds: ["autobahn-driver"],
+      sdk: {
+        threadSections: {
+          list: () => sections,
+          create: ({ name }) => ({
+            id: "section-" + name,
+            name,
+            createdAt: 1,
+            updatedAt: 1,
+          }),
+        },
+        projects: {
+          list: () => [
+            {
+              id: "project-1",
+              name: "Agentbox",
+              kind: "standard",
+              gitRemoteUrl: null,
+              createdAt: 1,
+              updatedAt: 1,
+              sources: [],
+            },
+          ],
+        },
+        threads: {
+          list: (args) =>
+            !args?.sectionId || row.sectionId === args.sectionId ? [row] : [],
+          get: () => ({ ...row, archivedAt: null, deletedAt: null }),
+          update: ({ sectionId }) => {
+            if (sectionId) row.sectionId = sectionId;
+            return row;
+          },
+          send,
+          stop: () => ({ ok: true }),
+          defaultExecutionOptions: async () => ({
+            model: "gpt-5.6",
+            reasoningLevel: "high",
+            permissionMode: "auto",
+            serviceTier: "default",
+            source: "client/turn/start",
+          }),
+          timeline: async () => ({ rows: [] }),
+          output: async () => ({ output: "Ready." }),
+        },
+      },
+    });
+    plugin(bb);
+    await harness.behavior.callAgentTool("autobahn_set_contract", {
+      threadId: "ready-card",
+      riskClass: "low",
+      priority: 0,
+      blockedBy: [],
+      requiresHumanApproval: false,
+      contract: {
+        objective: "Remain human-paced by default",
+        scope: ["server.ts"],
+        outOfScope: [],
+        expectedFiles: ["server.ts"],
+        acceptanceCriteria: ["No unattended send occurs"],
+        verificationCommands: ["npm test"],
+      },
+    });
+
+    await harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({
+        id: "ready-card",
+        projectId: "project-1",
+        sectionId: "section-OPEN",
+      }),
+      lastAssistantText: "Ready.",
+    });
+    await harness.behavior.emitThreadEvent("thread.archived", {
+      thread: makeThreadResponse({
+        id: "ready-card",
+        projectId: "project-1",
+        sectionId: "section-OPEN",
+      }),
+    });
+    await harness.behavior.runSchedule("auto-dispatch");
+
+    expect(send).not.toHaveBeenCalled();
+    expect(row.sectionId).toBe("section-OPEN");
+  });
+
 });
