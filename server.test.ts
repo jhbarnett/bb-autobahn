@@ -1129,6 +1129,269 @@ describe("autobahn backend", () => {
     ).toHaveLength(0);
   });
 
+  it("spawns hidden plan workers and cleans them up on success and failure", async () => {
+    const sections = ["OPEN", "WIP", "R4R", "CLOSED"].map((name) => ({
+      id: `section-${name}`,
+      name,
+      createdAt: 1,
+      updatedAt: 1,
+    }));
+    const row = {
+      id: "thread-1",
+      projectId: "project-1",
+      environmentId: "environment-1",
+      providerId: "codex",
+      title: "Policy-driven card",
+      titleFallback: null,
+      sectionId: "section-WIP",
+      status: "idle",
+      hasPendingInteraction: false,
+      environmentBranchName: "feature/policy",
+      updatedAt: Date.now(),
+    };
+    const plannerJson = JSON.stringify({
+      summary: "Ship hidden worker cleanup",
+      scope: ["server.ts"],
+      outOfScope: ["docs"],
+      implementationSteps: ["Edit server.ts"],
+      acceptanceCriteria: ["typecheck and tests pass"],
+      verification: ["npm test"],
+      risks: ["low"],
+      openQuestions: [],
+    });
+    const reviewJson = JSON.stringify({
+      verdict: "ACCEPT",
+      summary: "The plan is sound.",
+      concerns: [],
+      requiredChanges: [],
+    });
+    let spawned = 0;
+    let failChildOutput = false;
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "autobahn",
+      agentSkillIds: ["autobahn-driver"],
+      sdk: {
+        threadSections: {
+          list: () => sections,
+          create: ({ name }) => ({
+            id: `section-${name}`,
+            name,
+            createdAt: 1,
+            updatedAt: 1,
+          }),
+        },
+        environments: {
+          get: () => ({
+            hostId: "host-1",
+            isGitRepo: true,
+            branchName: "feature/policy",
+          }),
+        },
+        threads: {
+          get: () => ({ ...row, archivedAt: null, deletedAt: null }),
+          spawn: () => ({ id: `child-${++spawned}` }),
+          wait: async () => ({ ok: true }),
+          output: async ({ threadId }) => {
+            if (failChildOutput) throw new Error("child output unavailable");
+            return {
+              output: threadId === "child-1" ? plannerJson : reviewJson,
+            };
+          },
+          archive: async () => ({ ok: true }),
+          stop: async () => ({ ok: true }),
+          send: async () => ({ ok: true }),
+        },
+      },
+    });
+    plugin(bb);
+
+    await expect(
+      harness.behavior.callAgentTool("autobahn_run_plan", {
+        threadId: "thread-1",
+        objective: "Ship hidden worker cleanup",
+      }),
+    ).resolves.toContain("Plan accepted");
+
+    const spawns = harness.inspection.sdk.callsTo("threads.spawn");
+    expect(spawns).toHaveLength(2);
+    for (const [args] of spawns as Array<[Record<string, unknown>]>) {
+      expect(args).toMatchObject({
+        projectId: "project-1",
+        parentThreadId: "thread-1",
+        visibility: "hidden",
+        environment: {
+          type: "host",
+          hostId: "host-1",
+          workspace: {
+            type: "managed-worktree",
+            baseBranch: { kind: "named", name: "feature/policy" },
+          },
+        },
+      });
+    }
+    expect(
+      harness.inspection.sdk.callsTo("threads.archive").map(([args]) => args),
+    ).toEqual([{ threadId: "child-1" }, { threadId: "child-2" }]);
+    expect(
+      harness.inspection.sdk.callsTo("threads.stop").map(([args]) => args),
+    ).toEqual([{ threadId: "child-1" }, { threadId: "child-2" }]);
+
+    failChildOutput = true;
+    await expect(
+      harness.behavior.callAgentTool("autobahn_run_plan", {
+        threadId: "thread-1",
+        objective: "Ship hidden worker cleanup",
+      }),
+    ).rejects.toThrow("child output unavailable");
+    expect(
+      harness.inspection.sdk.callsTo("threads.archive").map(([args]) => args),
+    ).toContainEqual({ threadId: "child-3" });
+    expect(
+      harness.inspection.sdk.callsTo("threads.stop").map(([args]) => args),
+    ).toContainEqual({ threadId: "child-3" });
+  });
+
+  it("runs witness probes as hidden children with cleanup on every path", async () => {
+    const sections = ["OPEN", "WIP", "R4R", "CLOSED"].map((name) => ({
+      id: `section-${name}`,
+      name,
+      createdAt: 1,
+      updatedAt: 1,
+    }));
+    const rows = ["thread-err", "thread-err2"].map((id) => ({
+      id,
+      projectId: "project-1",
+      environmentId: null,
+      providerId: "codex",
+      title: `Failing work ${id}`,
+      titleFallback: null,
+      sectionId: "section-WIP",
+      status: "error",
+      hasPendingInteraction: false,
+      environmentBranchName: null,
+      updatedAt: Date.now(),
+    }));
+    let probeCount = 0;
+    let probeShouldFail = false;
+    const send = vi.fn(() => ({ ok: true }));
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "autobahn",
+      agentSkillIds: ["autobahn-driver"],
+      sdk: {
+        threadSections: {
+          list: () => sections,
+          create: ({ name }) => ({
+            id: `section-${name}`,
+            name,
+            createdAt: 1,
+            updatedAt: 1,
+          }),
+        },
+        projects: {
+          list: () => [
+            {
+              id: "project-1",
+              name: "Agentbox",
+              kind: "standard",
+              gitRemoteUrl: null,
+              createdAt: 1,
+              updatedAt: 1,
+              sources: [],
+            },
+          ],
+        },
+        threads: {
+          list: () => rows,
+          get: ({ threadId }) => {
+            const found = rows.find((candidate) => candidate.id === threadId);
+            return {
+              ...(found ?? { id: threadId, projectId: "project-1" }),
+              archivedAt: null,
+              deletedAt: null,
+            };
+          },
+          spawn: ({ title }) =>
+            title === "Autobahn witness probe"
+              ? { id: `probe-${++probeCount}` }
+              : { id: "driver-thread" },
+          wait: async () => ({ ok: true }),
+          output: async ({ threadId }) => {
+            if (typeof threadId === "string" && threadId.startsWith("probe-")) {
+              if (probeShouldFail) throw new Error("probe crashed");
+              return { output: "Restart the failed runtime." };
+            }
+            return { output: "Working." };
+          },
+          archive: async () => ({ ok: true }),
+          stop: async () => ({ ok: true }),
+          send,
+          defaultExecutionOptions: async () => ({
+            model: "gpt-5.6",
+            reasoningLevel: "high",
+            permissionMode: "auto",
+            serviceTier: "default",
+            source: "client/turn/start",
+          }),
+          timeline: async () => ({ rows: [] }),
+        },
+      },
+    });
+    plugin(bb);
+    await harness.behavior.callRpc("getDriver");
+
+    await harness.behavior.emitThreadEvent("thread.failed", {
+      thread: makeThreadResponse({ id: "thread-err" }),
+    });
+    const probeSpawns = harness.inspection.sdk
+      .callsTo("threads.spawn")
+      .map(([args]) => args as Record<string, unknown>)
+      .filter((args) => args.title === "Autobahn witness probe");
+    expect(probeSpawns).toHaveLength(1);
+    expect(probeSpawns[0]).toMatchObject({
+      projectId: "project-1",
+      parentThreadId: "thread-err",
+      visibility: "hidden",
+      environment: { type: "project-default" },
+    });
+    expect(
+      harness.inspection.sdk.callsTo("threads.archive").map(([args]) => args),
+    ).toContainEqual({ threadId: "probe-1" });
+    expect(
+      harness.inspection.sdk.callsTo("threads.stop").map(([args]) => args),
+    ).toContainEqual({ threadId: "probe-1" });
+    expect(send).toHaveBeenCalledTimes(1);
+    const success = send.mock.calls[0]![0] as {
+      input: Array<{ text: string }>;
+    };
+    expect(success.input[0]!.text).toContain(
+      "thread-err: runtime is in error",
+    );
+    expect(success.input[0]!.text).toContain(
+      "Witness probe recommendation:\nRestart the failed runtime.",
+    );
+
+    probeShouldFail = true;
+    await harness.behavior.emitThreadEvent("thread.failed", {
+      thread: makeThreadResponse({ id: "thread-err2" }),
+    });
+    expect(
+      harness.inspection.sdk.callsTo("threads.archive").map(([args]) => args),
+    ).toContainEqual({ threadId: "probe-2" });
+    expect(
+      harness.inspection.sdk.callsTo("threads.stop").map(([args]) => args),
+    ).toContainEqual({ threadId: "probe-2" });
+    expect(send).toHaveBeenCalledTimes(2);
+    const fallback = send.mock.calls[1]![0] as {
+      input: Array<{ text: string }>;
+    };
+    expect(fallback.input[0]!.text).toContain(
+      "thread-err2: runtime is in error",
+    );
+    expect(fallback.input[0]!.text).toContain(
+      "Recommend action; do not stop work automatically.",
+    );
+  });
+
   it("selects only skill ids shipped by the manifest's skills directory", async () => {
     const skillsRoot = join(
       dirname(fileURLToPath(import.meta.url)),
