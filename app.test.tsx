@@ -101,9 +101,11 @@ const board: BoardResult = {
       updatedAt: "2026-08-19T00:00:00Z",
       projectId: "project-1",
       linkedThreadId: null,
+      captured: true,
     },
   ],
   needsYouCount: 1,
+  snoozedCount: 0,
 };
 
 describe("autobahn panel", () => {
@@ -113,6 +115,7 @@ describe("autobahn panel", () => {
       status,
     }));
     const clearStatusOverride = vi.fn(() => ({ ok: true as const }));
+    const snoozeRoadmapItem = vi.fn(() => ({ ok: true as const }));
     const app = await loadPluginApp(() => import("./app"));
     const slot = renderSlot(
       app.navPanels[0]!,
@@ -126,6 +129,9 @@ describe("autobahn panel", () => {
           }),
           getDriver: () => ({ threadId: "driver-thread" }),
           clearStatusOverride,
+          snoozeRoadmapItem,
+          wakeRoadmapItem: () => ({ ok: true as const }),
+          clearClosedCards: () => ({ cleared: 0 }),
         },
       },
     );
@@ -135,12 +141,45 @@ describe("autobahn panel", () => {
     ).toEqual(["OPEN", "WIP", "R4R", "CLOSED"]);
     expect(slot.getByText("Ship feature")).toBeTruthy();
     expect(slot.getByText("Top roadmap issue")).toBeTruthy();
+    expect(slot.getByText("Captured")).toBeTruthy();
     expect(slot.getByRole("link", { name: "acme/repo#42" })).toBeTruthy();
+    const expandRoadmap = slot.getByRole("button", {
+      name: "Expand Open roadmap",
+    });
+    expect(expandRoadmap.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(expandRoadmap);
+    expect(
+      slot
+        .getByRole("button", { name: "Collapse Open roadmap" })
+        .getAttribute("aria-expanded"),
+    ).toBe("true");
+    const expandClosed = slot.getByRole("button", {
+      name: "Expand Closed lane",
+    });
+    expect(expandClosed.getAttribute("aria-expanded")).toBe("false");
+    fireEvent.click(expandClosed);
+    expect(
+      slot
+        .getByRole("button", { name: "Collapse Closed lane" })
+        .getAttribute("aria-expanded"),
+    ).toBe("true");
     expect(slot.getByLabelText("Card state colors")).toBeTruthy();
     expect(
       slot.getByLabelText("Card state: Needs human attention"),
     ).toBeTruthy();
     expect(slot.getByLabelText("Card state: Idle or queued")).toBeTruthy();
+    fireEvent.click(
+      slot.getByRole("button", { name: "Snooze Top roadmap issue" }),
+    );
+    fireEvent.click(slot.getByRole("button", { name: "1 day" }));
+    await vi.waitFor(() => {
+      expect(snoozeRoadmapItem).toHaveBeenCalledWith(
+        expect.objectContaining({
+          itemKey: "issue:acme/repo#42",
+          wakeAt: expect.any(Number),
+        }),
+      );
+    });
     expect(slot.queryByText("codex")).toBeNull();
     expect(
       slot.container.querySelector('[data-icon="ChatGPT"]'),
@@ -238,6 +277,48 @@ describe("autobahn panel", () => {
     slot.lifecycle.unmount();
   });
 
+  it("clears Closed cards from the display without lifecycle actions", async () => {
+    const closedBoard = structuredClone(board);
+    const closedCard = closedBoard.lanes[1]!.cards.shift()!;
+    closedCard.status = "CLOSED";
+    closedCard.runtimeStatus = "idle";
+    closedCard.workflow.phase = "complete";
+    closedCard.workflow.gate = "none";
+    closedCard.attention = [];
+    closedBoard.lanes[3]!.cards.push(closedCard);
+    const clearClosedCards = vi.fn(() => ({ cleared: 1 }));
+    const app = await loadPluginApp(() => import("./app"));
+    const slot = renderSlot(
+      app.navPanels[0]!,
+      { subPath: "" },
+      {
+        rpc: {
+          listBoard: () => closedBoard,
+          moveThread: ({ threadId, status }) => ({
+            threadId,
+            status,
+            warning: null,
+          }),
+          getDriver: () => ({ threadId: "driver-thread" }),
+          clearStatusOverride: () => ({ ok: true as const }),
+          snoozeRoadmapItem: () => ({ ok: true as const }),
+          wakeRoadmapItem: () => ({ ok: true as const }),
+          clearClosedCards,
+        },
+      },
+    );
+
+    const broom = await slot.findByRole("button", {
+      name: "Clear Closed cards",
+    });
+    expect(broom).not.toHaveProperty("disabled", true);
+    fireEvent.click(broom);
+    await vi.waitFor(() => {
+      expect(clearClosedCards).toHaveBeenCalledWith({});
+    });
+    slot.lifecycle.unmount();
+  });
+
   it("opens and closes the persistent Driver thread in a side panel", async () => {
     const app = await loadPluginApp(() => import("./app"));
     const header = renderSlot(
@@ -318,6 +399,49 @@ describe("autobahn panel", () => {
         approved: true,
         note: "Looks good",
       });
+    });
+    interaction.lifecycle.unmount();
+  });
+
+  it("requires explicit confirmation before capturing tracker work", async () => {
+    const app = await loadPluginApp(() => import("./app"));
+    const submit = vi.fn(async () => undefined);
+    const cancel = vi.fn(async () => undefined);
+    const interaction = renderSlot(
+      app.pendingInteractions[1]!,
+      {
+        interaction: {
+          id: "interaction-capture",
+          threadId: "thread-1",
+          title: "Capture tracker work",
+          payload: {
+            projectId: "project-1",
+            title: "Document security boundary",
+            description: "Capture the marketplace hardening follow-up.",
+            acceptanceCriteria: ["Security model is documented"],
+            labels: ["security", "documentation"],
+          },
+          createdAt: 1,
+          expiresAt: null,
+        },
+        submit,
+        cancel,
+      },
+    );
+
+    expect(
+      interaction.getByText("Capture this work in the issue tracker?"),
+    ).toBeTruthy();
+    expect(interaction.getByText("Document security boundary")).toBeTruthy();
+    expect(interaction.getByText("Security model is documented")).toBeTruthy();
+    expect(
+      interaction.getByText("Labels: security, documentation"),
+    ).toBeTruthy();
+    fireEvent.click(
+      interaction.getByRole("button", { name: "Capture work" }),
+    );
+    await vi.waitFor(() => {
+      expect(submit).toHaveBeenCalledWith({ approved: true });
     });
     interaction.lifecycle.unmount();
   });

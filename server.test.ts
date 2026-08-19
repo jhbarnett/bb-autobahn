@@ -3,9 +3,41 @@ import {
   createFakePluginHost,
   makeThreadResponse,
 } from "@get-bb/plugin-sdk/testing";
-import plugin from "./server";
+import plugin, { rankRoadmapItems } from "./server";
 
 describe("autobahn backend", () => {
+  it("supports priority, recency, and balanced roadmap rankings", () => {
+    const items = [
+      { id: "a-new-p2", repo: "acme/a", priority: 2, updatedAt: "2026-08-04" },
+      { id: "a-old-p0", repo: "acme/a", priority: 0, updatedAt: "2026-08-01" },
+      { id: "a-new-p0", repo: "acme/a", priority: 0, updatedAt: "2026-08-03" },
+      { id: "b-unlabeled", repo: "acme/b", priority: 4, updatedAt: "2026-08-02" },
+      { id: "c-p3", repo: "acme/c", priority: 3, updatedAt: "2026-08-05" },
+      {
+        id: "captured-old-p3",
+        repo: "acme/d",
+        priority: 3,
+        updatedAt: "2026-07-01",
+        captured: true,
+      },
+    ];
+
+    expect(
+      rankRoadmapItems(items, 3, "priority").map((item) => item.id),
+    ).toEqual(["captured-old-p3", "a-new-p0", "a-old-p0"]);
+    expect(
+      rankRoadmapItems(items, 3, "recency").map((item) => item.id),
+    ).toEqual(["captured-old-p3", "c-p3", "a-new-p2"]);
+    expect(
+      rankRoadmapItems(items, 5, "balanced").map((item) => item.id),
+    ).toEqual([
+      "captured-old-p3",
+      "a-new-p0",
+      "b-unlabeled",
+      "c-p3",
+      "a-old-p0",
+    ]);
+  });
   it("builds cards from bb data and lets an agent move its current thread", async () => {
     const sections = ["OPEN", "WIP", "R4R", "CLOSED"].map((name) => ({
       id: `section-${name}`,
@@ -141,6 +173,177 @@ describe("autobahn backend", () => {
     ).rejects.toThrow("completed fresh-context verification panel");
   });
 
+  it("snoozes roadmap issues and wakes them automatically", async () => {
+    const now = Date.now();
+    const dateNow = vi.spyOn(Date, "now").mockReturnValue(now);
+    const sections = ["OPEN", "WIP", "R4R", "CLOSED"].map((name) => ({
+      id: `section-${name}`,
+      name,
+      createdAt: 1,
+      updatedAt: 1,
+    }));
+    const issue = {
+      repo: "acme/repo",
+      number: 42,
+      kind: "issue",
+      title: "Future work",
+      state: "open",
+      author: "agent",
+      labels: [],
+      assignees: [],
+      url: "https://github.com/acme/repo/issues/42",
+      body: "",
+      updatedAt: "2026-08-19T00:00:00Z",
+    };
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "autobahn",
+      agentSkillIds: ["autobahn-driver"],
+      sdk: {
+        plugins: {
+          callRpc: async ({ method }) => {
+            if (method === "listItems") return { items: [issue] };
+            if (method === "listLinks") return { links: {} };
+            if (method === "status") {
+              return {
+                ghOk: true,
+                ghError: null,
+                repos: [{ repo: "acme/repo", projectId: "project-1" }],
+                lastSyncedAt: "2026-08-19T00:00:00Z",
+              };
+            }
+            throw new Error("Unexpected GitHub RPC " + method);
+          },
+        },
+        threadSections: {
+          list: () => sections,
+          create: ({ name }) => ({
+            id: `section-${name}`,
+            name,
+            createdAt: 1,
+            updatedAt: 1,
+          }),
+        },
+        projects: { list: () => [] },
+        threads: { list: () => [] },
+      },
+    });
+    plugin(bb);
+
+    const before = await harness.behavior.callRpc("listBoard", {});
+    expect(before.roadmapItems).toHaveLength(1);
+    expect(before.snoozedCount).toBe(0);
+    await harness.behavior.callRpc("snoozeRoadmapItem", {
+      itemKey: "issue:acme/repo#42",
+      wakeAt: now + 1_000,
+    });
+    const snoozed = await harness.behavior.callRpc("listBoard", {});
+    expect(snoozed.roadmapItems).toHaveLength(0);
+    expect(snoozed.snoozedCount).toBe(1);
+
+    dateNow.mockReturnValue(now + 1_001);
+    const woken = await harness.behavior.callRpc("listBoard", {});
+    expect(woken.roadmapItems).toHaveLength(1);
+    expect(woken.snoozedCount).toBe(0);
+    dateNow.mockRestore();
+  });
+
+  it("clears Closed cards without archiving and refreshes on archive", async () => {
+    const sections = ["OPEN", "WIP", "R4R", "CLOSED"].map((name) => ({
+      id: `section-${name}`,
+      name,
+      createdAt: 1,
+      updatedAt: 1,
+    }));
+    const row = {
+      id: "closed-thread",
+      projectId: "project-1",
+      environmentId: null,
+      providerId: "codex",
+      title: "Completed work",
+      titleFallback: null,
+      sectionId: "section-CLOSED",
+      status: "idle",
+      hasPendingInteraction: false,
+      environmentBranchName: null,
+      updatedAt: Date.now(),
+    };
+    const archive = vi.fn();
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "autobahn",
+      agentSkillIds: ["autobahn-driver"],
+      sdk: {
+        plugins: {
+          callRpc: async ({ method }) => {
+            if (method === "listItems") return { items: [] };
+            if (method === "listLinks") return { links: {} };
+            if (method === "status") {
+              return { ghOk: true, ghError: null, repos: [], lastSyncedAt: null };
+            }
+            throw new Error("Unexpected GitHub RPC " + method);
+          },
+        },
+        threadSections: {
+          list: () => sections,
+          create: ({ name }) => ({
+            id: `section-${name}`,
+            name,
+            createdAt: 1,
+            updatedAt: 1,
+          }),
+        },
+        projects: {
+          list: () => [
+            {
+              id: "project-1",
+              name: "Agentbox",
+              kind: "standard",
+              gitRemoteUrl: null,
+              createdAt: 1,
+              updatedAt: 1,
+              sources: [],
+            },
+          ],
+        },
+        threads: {
+          list: () => [row],
+          defaultExecutionOptions: async () => ({
+            model: "gpt-5.6",
+            reasoningLevel: "high",
+            permissionMode: "auto",
+            serviceTier: "default",
+            source: "client/turn/start",
+          }),
+          timeline: async () => ({ rows: [] }),
+          output: async () => ({ output: "Done." }),
+          archive,
+        },
+      },
+    });
+    plugin(bb);
+
+    const before = await harness.behavior.callRpc("listBoard", {});
+    expect(before.lanes.find((lane) => lane.status === "CLOSED")?.cards).toHaveLength(1);
+    await expect(
+      harness.behavior.callRpc("clearClosedCards", {}),
+    ).resolves.toEqual({ cleared: 1 });
+    const after = await harness.behavior.callRpc("listBoard", {});
+    expect(after.lanes.find((lane) => lane.status === "CLOSED")?.cards).toHaveLength(0);
+    expect(archive).not.toHaveBeenCalled();
+    await harness.behavior.emitThreadEvent("thread.archived", {
+      thread: makeThreadResponse({ id: "closed-thread" }),
+    });
+    expect(
+      harness.inspection.realtimeSignals.some(
+        (signal) => signal.channel === "board-changed",
+      ),
+    ).toBe(true);
+    expect(
+      harness.inspection.sdk.callsTo("threads.list").some(
+        ([args]) => args?.archived === false,
+      ),
+    ).toBe(true);
+  });
+
   it("captures tracker work without starting a session and reuses duplicates", async () => {
     const items: Array<Record<string, unknown>> = [];
     let nextNumber = 73;
@@ -205,15 +408,43 @@ describe("autobahn backend", () => {
       acceptanceCriteria: ["Linear items appear in the Open roadmap"],
       labels: ["roadmap", "integration"],
     };
-    await expect(
-      harness.behavior.callAgentTool(
-        "autobahn_capture_work",
-        input,
-        { threadId: "source-thread", projectId: "project-1" },
-      ),
-    ).resolves.toContain(
+    const firstCapture = harness.behavior.callAgentTool(
+      "autobahn_capture_work",
+      input,
+      { threadId: "source-thread", projectId: "project-1" },
+    );
+    await vi.waitFor(() => {
+      expect(harness.inspection.pendingInteractions).toHaveLength(1);
+    });
+    expect(
+      callRpc.mock.calls.filter(([args]) => args.method === "createIssue"),
+    ).toHaveLength(0);
+    harness.behavior.submitInteraction(
+      harness.inspection.pendingInteractions[0]!.id,
+      { approved: true },
+    );
+    await expect(firstCapture).resolves.toContain(
       "Created github work item acme/repo#73: https://github.com/acme/repo/issues/73",
     );
+
+    async function resolveCapture(
+      payload: typeof input,
+      approved: boolean,
+    ) {
+      const running = harness.behavior.callAgentTool(
+        "autobahn_capture_work",
+        payload,
+        { threadId: "source-thread", projectId: "project-1" },
+      );
+      await vi.waitFor(() => {
+        expect(harness.inspection.pendingInteractions).toHaveLength(1);
+      });
+      harness.behavior.submitInteraction(
+        harness.inspection.pendingInteractions[0]!.id,
+        { approved },
+      );
+      return await running;
+    }
     const createCall = callRpc.mock.calls.find(
       ([args]) => args.method === "createIssue",
     )?.[0];
@@ -248,26 +479,34 @@ describe("autobahn backend", () => {
     );
 
     await expect(
-      harness.behavior.callAgentTool(
-        "autobahn_capture_work",
+      resolveCapture(
         { ...input, title: "  add   linear capture ADAPTER " },
-        { threadId: "source-thread", projectId: "project-1" },
+        true,
       ),
     ).resolves.toContain("Reused existing github work item acme/repo#73");
     expect(
       callRpc.mock.calls.filter(([args]) => args.method === "createIssue"),
     ).toHaveLength(1);
 
+    await expect(
+      resolveCapture(
+        { ...input, title: "Declined work item" },
+        false,
+      ),
+    ).resolves.toContain("declined; no tracker item was created");
+    expect(
+      callRpc.mock.calls.filter(([args]) => args.method === "createIssue"),
+    ).toHaveLength(1);
+
     failLabels = true;
     await expect(
-      harness.behavior.callAgentTool(
-        "autobahn_capture_work",
+      resolveCapture(
         {
           ...input,
           title: "Capture tracker projects",
           labels: ["epic"],
         },
-        { threadId: "source-thread", projectId: "project-1" },
+        true,
       ),
     ).resolves.toContain("labels could not be applied");
 
@@ -455,6 +694,37 @@ describe("autobahn backend", () => {
     });
     expect(childConfig.tools).toEqual([]);
     expect(childConfig.instructions).toContain("read-only");
+
+    const spoofedRootConfig =
+      await harness.behavior.resolveAgentConfiguration({
+        thread: {
+          id: "worker-thread",
+          title: "Autobahn verification: spoofed root",
+          parentThreadId: null,
+          sourceThreadId: null,
+        },
+        project: {
+          id: "project-1",
+          kind: "standard",
+          name: "Agentbox",
+          gitRemoteUrl: null,
+        },
+        environment: {
+          id: "environment-1",
+          name: null,
+          path: "/workspace",
+          workspaceProvisionType: "managed-worktree",
+          branchName: "feature/test",
+        },
+        host: { id: "host-1", name: "Local" },
+        provider: { id: "codex", model: "gpt-5.6" },
+        origin: { kind: null, pluginId: "autobahn" },
+      });
+    expect(spoofedRootConfig.tools.map((tool) => tool.name)).toEqual([
+      "autobahn_move_thread",
+      "autobahn_capture_work",
+      "autobahn_report_exit",
+    ]);
 
     await expect(
       harness.behavior.callAgentTool("autobahn_create_session", {

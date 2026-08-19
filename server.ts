@@ -22,9 +22,74 @@ import {
 
 export const BOARD_STATUSES = ["OPEN", "WIP", "R4R", "CLOSED"] as const;
 
+export const ROADMAP_RANKINGS = ["balanced", "priority", "recency"] as const;
+export type RoadmapRanking = (typeof ROADMAP_RANKINGS)[number];
+
+export function rankRoadmapItems<
+  Item extends {
+    repo: string;
+    priority: number;
+    updatedAt: string;
+    captured?: boolean;
+  },
+>(items: Item[], limit: number, ranking: RoadmapRanking): Item[] {
+  const candidates = [...items];
+  const newestFirst = (left: Item, right: Item) =>
+    Date.parse(right.updatedAt) - Date.parse(left.updatedAt);
+  const captured = candidates.filter((item) => item.captured);
+  const ordinary = candidates.filter((item) => !item.captured);
+
+  if (ranking === "recency") {
+    return [
+      ...captured.sort(newestFirst),
+      ...ordinary.sort(newestFirst),
+    ].slice(0, limit);
+  }
+  if (ranking === "priority") {
+    const byPriority = (left: Item, right: Item) =>
+      left.priority - right.priority || newestFirst(left, right);
+    return [
+      ...captured.sort(byPriority),
+      ...ordinary.sort(byPriority),
+    ].slice(0, limit);
+  }
+
+  const capturedFront = captured.sort(newestFirst);
+  const remainingLimit = Math.max(0, limit - capturedFront.length);
+  if (remainingLimit === 0) return capturedFront.slice(0, limit);
+
+  const tier = (item: Item) =>
+    item.priority === 4 ? 2 : item.priority;
+  ordinary.sort(
+    (left, right) => tier(left) - tier(right) || newestFirst(left, right),
+  );
+  const queueByRepo = new Map<string, Item[]>();
+  for (const item of ordinary) {
+    const queue = queueByRepo.get(item.repo);
+    if (queue) queue.push(item);
+    else queueByRepo.set(item.repo, [item]);
+  }
+  const queues = [...queueByRepo.values()];
+  const picked: Item[] = [];
+  while (
+    picked.length < remainingLimit &&
+    queues.some((queue) => queue.length > 0)
+  ) {
+    for (const queue of queues) {
+      const item = queue.shift();
+      if (item) picked.push(item);
+      if (picked.length >= remainingLimit) break;
+    }
+  }
+  return [...capturedFront, ...picked].slice(0, limit);
+}
+
 const DRIVER_TITLE = "Autobahn Driver";
 const DRIVER_THREAD_KEY = "autobahn-driver-thread-id";
 const WITNESS_FINGERPRINT_KEY = "witness-last-fingerprint";
+const ROADMAP_SNOOZES_KEY = "roadmap-snoozes";
+const CLOSED_DISMISSALS_KEY = "closed-card-dismissals";
+const MAX_SNOOZE_MS = 366 * 24 * 60 * 60 * 1_000;
 const DRIVER_PROMPT =
   "You are the policy-driven Driver for this Autobahn board. Briefly introduce yourself and offer to inventory work, establish plan contracts and gates, dispatch within WIP, run fresh-context planning and verification, park or wake work, and surface witness findings. Inspect the board before making claims. Never bypass a human gate, stop, or archive a session unless the user asks.";
 
@@ -166,6 +231,10 @@ const githubRefreshOutputSchema = z
   })
   .strict();
 
+const roadmapItemKeySchema = z
+  .string()
+  .regex(/^issue:[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+#\d+$/);
+
 const roadmapItemSchema = z.object({
   id: z.string(),
   repo: z.string(),
@@ -177,6 +246,7 @@ const roadmapItemSchema = z.object({
   updatedAt: z.string(),
   projectId: z.string().nullable(),
   linkedThreadId: z.string().nullable(),
+  captured: z.boolean(),
 });
 
 const externalLinkSchema = z.object({
@@ -224,6 +294,7 @@ export type BoardResult = {
   lanes: Array<z.infer<typeof laneSchema>>;
   roadmapItems: Array<z.infer<typeof roadmapItemSchema>>;
   needsYouCount: number;
+  snoozedCount: number;
 };
 
 export const rpcContract = defineRpcContract({
@@ -233,6 +304,7 @@ export const rpcContract = defineRpcContract({
       lanes: z.array(laneSchema),
       roadmapItems: z.array(roadmapItemSchema),
       needsYouCount: z.number().int().nonnegative(),
+      snoozedCount: z.number().int().nonnegative(),
     }),
   },
   moveThread: {
@@ -252,6 +324,25 @@ export const rpcContract = defineRpcContract({
   clearStatusOverride: {
     input: z.object({ threadId: z.string().min(1) }).strict(),
     output: z.object({ ok: z.literal(true) }),
+  },
+  snoozeRoadmapItem: {
+    input: z
+      .object({
+        itemKey: roadmapItemKeySchema,
+        wakeAt: z.number().int().positive(),
+      })
+      .strict(),
+    output: z.object({ ok: z.literal(true) }),
+  },
+  wakeRoadmapItem: {
+    input: z.object({ itemKey: roadmapItemKeySchema }).strict(),
+    output: z.object({ ok: z.literal(true) }),
+  },
+  clearClosedCards: {
+    input: z
+      .object({ projectId: z.string().min(1).nullable().optional() })
+      .strict(),
+    output: z.object({ cleared: z.number().int().nonnegative() }),
   },
 });
 
@@ -402,6 +493,46 @@ export default function plugin(bb: BbPluginApi) {
   const database = bb.storage.database();
   bb.storage.migrate(database, [...WORKFLOW_STATE_MIGRATIONS]);
   const workflowStore = createWorkflowStateStore(database);
+  const isolatedChildThreadIds = new Set(
+    workflowStore
+      .listEvents()
+      .filter((event) => event.type === "child.spawned")
+      .map((event) => event.payload.childThreadId)
+      .filter((threadId): threadId is string => typeof threadId === "string"),
+  );
+  async function readClosedDismissals() {
+    const stored =
+      (await bb.storage.kv.get<unknown>(CLOSED_DISMISSALS_KEY)) ?? [];
+    return new Set(
+      Array.isArray(stored)
+        ? stored.filter((threadId): threadId is string => typeof threadId === "string")
+        : [],
+    );
+  }
+
+  async function readRoadmapSnoozes() {
+    const stored =
+      (await bb.storage.kv.get<Record<string, unknown>>(ROADMAP_SNOOZES_KEY)) ??
+      {};
+    const now = Date.now();
+    const active: Record<string, number> = {};
+    let changed = false;
+    for (const [itemKey, wakeAt] of Object.entries(stored)) {
+      if (
+        roadmapItemKeySchema.safeParse(itemKey).success &&
+        typeof wakeAt === "number" &&
+        Number.isSafeInteger(wakeAt) &&
+        wakeAt > now
+      ) {
+        active[itemKey] = wakeAt;
+      } else {
+        changed = true;
+      }
+    }
+    if (changed) await bb.storage.kv.set(ROADMAP_SNOOZES_KEY, active);
+    return active;
+  }
+
   const settings = bb.settings.define({
     wipLimit: {
       type: "string",
@@ -427,6 +558,11 @@ export default function plugin(bb: BbPluginApi) {
       type: "string",
       label: "Open roadmap item limit",
       default: "5",
+    },
+    roadmapRanking: {
+      type: "string",
+      label: "Roadmap ranking (balanced | priority | recency)",
+      default: "balanced",
     },
   });
 
@@ -476,8 +612,9 @@ export default function plugin(bb: BbPluginApi) {
         prompt: input.prompt,
         title: input.title,
         visibility: "hidden",
-        permissionMode: "auto",
+        permissionMode: "accept-edits",
       });
+      isolatedChildThreadIds.add(child.id);
       workflowStore.appendEvent({
         threadId: input.controllerThreadId,
         type: "child.spawned",
@@ -594,6 +731,13 @@ export default function plugin(bb: BbPluginApi) {
     return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
   }
 
+  function roadmapRanking(value: string): RoadmapRanking {
+    const normalized = value.trim().toLowerCase();
+    return (ROADMAP_RANKINGS as readonly string[]).includes(normalized)
+      ? (normalized as RoadmapRanking)
+      : "balanced";
+  }
+
   interface GithubSnapshot {
     items: GithubItem[];
     links: Record<string, GithubLink[]>;
@@ -700,12 +844,27 @@ export default function plugin(bb: BbPluginApi) {
     return `${item.kind}:${item.repo}#${item.number}`;
   }
 
+  function capturedIssueKeys() {
+    return new Set(
+      workflowStore
+        .listEvents()
+        .filter((event) =>
+          ["work.captured", "work.capture-reused"].includes(event.type),
+        )
+        .map((event) => event.payload.itemKey)
+        .filter((itemKey): itemKey is string => typeof itemKey === "string"),
+    );
+  }
+
   function roadmapItems(
     snapshot: GithubSnapshot,
     limit: number,
-    projectId?: string | null,
+    projectId: string | null | undefined,
+    ranking: RoadmapRanking,
+    capturedKeys: Set<string>,
+    snoozes: Record<string, number>,
   ) {
-    return snapshot.items
+    const candidates = snapshot.items
       .filter(
         (item) =>
           item.kind === "issue" &&
@@ -713,6 +872,7 @@ export default function plugin(bb: BbPluginApi) {
           (!projectId || snapshot.projectByRepo.get(item.repo) === projectId),
       )
       .filter((item) => !(snapshot.links[githubItemKey(item)]?.length))
+      .filter((item) => !(githubItemKey(item) in snoozes))
       .map((item) => ({
         id: githubItemKey(item),
         repo: item.repo,
@@ -725,13 +885,24 @@ export default function plugin(bb: BbPluginApi) {
         projectId: snapshot.projectByRepo.get(item.repo) ?? null,
         linkedThreadId:
           snapshot.links[githubItemKey(item)]?.at(-1)?.threadId ?? null,
-      }))
-      .sort(
-        (left, right) =>
-          left.priority - right.priority ||
-          Date.parse(right.updatedAt) - Date.parse(left.updatedAt),
-      )
-      .slice(0, limit);
+        captured: capturedKeys.has(githubItemKey(item)),
+      }));
+    return rankRoadmapItems(candidates, limit, ranking);
+  }
+
+  function snoozedRoadmapCount(
+    snapshot: GithubSnapshot,
+    snoozes: Record<string, number>,
+    projectId?: string | null,
+  ) {
+    return snapshot.items.filter(
+      (item) =>
+        item.kind === "issue" &&
+        item.state.toLowerCase() === "open" &&
+        githubItemKey(item) in snoozes &&
+        !(snapshot.links[githubItemKey(item)]?.length) &&
+        (!projectId || snapshot.projectByRepo.get(item.repo) === projectId),
+    ).length;
   }
 
   function normalizedWorkTitle(title: string) {
@@ -810,6 +981,7 @@ export default function plugin(bb: BbPluginApi) {
         payload: {
           tracker: "github",
           externalId: `${repo}#${duplicate.number}`,
+          itemKey: githubItemKey(duplicate),
           url: duplicate.url,
           title: input.title.trim(),
         },
@@ -865,6 +1037,10 @@ export default function plugin(bb: BbPluginApi) {
       payload: {
         tracker: "github",
         externalId,
+        itemKey:
+          created.number === null
+            ? null
+            : `issue:${repo}#${created.number}`,
         url: created.url,
         title: input.title.trim(),
         labels,
@@ -1008,6 +1184,12 @@ export default function plugin(bb: BbPluginApi) {
       ? null
       : await moveWarning(threadId, status, sections);
     await bb.sdk.threads.update({ threadId, sectionId: sections[status] });
+    if (status !== "CLOSED") {
+      const dismissals = await readClosedDismissals();
+      if (dismissals.delete(threadId)) {
+        await bb.storage.kv.set(CLOSED_DISMISSALS_KEY, [...dismissals]);
+      }
+    }
     const phase = options.preserveWorkflowPosition
       ? current?.phase ?? "intake"
       : status === "WIP"
@@ -1235,14 +1417,38 @@ export default function plugin(bb: BbPluginApi) {
 
   async function listBoard(projectId?: string | null) {
     await syncExternalStatuses(projectId);
-    const [sections, projects, threads, configured, githubSnapshot] =
-      await Promise.all([
+    const [
+      sections,
+      projects,
+      threads,
+      configured,
+      githubSnapshot,
+      roadmapSnoozes,
+      closedDismissals,
+    ] = await Promise.all([
         ensureSections(),
         bb.sdk.projects.list({ includePersonal: true }),
         listThreads(projectId),
         settings.get(),
         loadGithubSnapshot(),
+        readRoadmapSnoozes(),
+        readClosedDismissals(),
       ]);
+    const activeClosedIds = new Set(
+      threads
+        .filter((thread) => thread.sectionId === sections.CLOSED)
+        .map((thread) => thread.id),
+    );
+    let dismissalsPruned = false;
+    for (const threadId of closedDismissals) {
+      if (!activeClosedIds.has(threadId)) {
+        closedDismissals.delete(threadId);
+        dismissalsPruned = true;
+      }
+    }
+    if (dismissalsPruned) {
+      await bb.storage.kv.set(CLOSED_DISMISSALS_KEY, [...closedDismissals]);
+    }
     const projectNames = new Map(
       projects.map((project) => [project.id, project.name]),
     );
@@ -1409,7 +1615,11 @@ export default function plugin(bb: BbPluginApi) {
       CLOSED: null,
     };
     const lanes = BOARD_STATUSES.map((status) => {
-      const laneCards = cards.filter((card) => card.status === status);
+      const laneCards = cards.filter(
+        (card) =>
+          card.status === status &&
+          !(status === "CLOSED" && closedDismissals.has(card.id)),
+      );
       const capacityCount = laneCards.filter(
         (card) => card.workflow.parkedWake === null,
       ).length;
@@ -1435,6 +1645,14 @@ export default function plugin(bb: BbPluginApi) {
       roadmapItems: roadmapItems(
         githubSnapshot,
         positiveInteger(configured.roadmapLimit, 5),
+        projectId,
+        roadmapRanking(configured.roadmapRanking),
+        capturedIssueKeys(),
+        roadmapSnoozes,
+      ),
+      snoozedCount: snoozedRoadmapCount(
+        githubSnapshot,
+        roadmapSnoozes,
         projectId,
       ),
       needsYouCount: lanes
@@ -1983,6 +2201,58 @@ export default function plugin(bb: BbPluginApi) {
     });
   }
 
+  async function clearClosedCards(projectId?: string | null) {
+    const sections = await ensureSections();
+    const threads = await listThreads(projectId);
+    const closedIds = threads
+      .filter((thread) => thread.sectionId === sections.CLOSED)
+      .map((thread) => thread.id);
+    const dismissals = await readClosedDismissals();
+    for (const threadId of closedIds) dismissals.add(threadId);
+    await bb.storage.kv.set(CLOSED_DISMISSALS_KEY, [...dismissals]);
+    bb.realtime.publish("board-changed", {
+      event: "closed.cleared",
+      count: closedIds.length,
+    });
+    return closedIds.length;
+  }
+
+  async function snoozeRoadmapItem(itemKey: string, wakeAt: number) {
+    const now = Date.now();
+    if (wakeAt <= now || wakeAt > now + MAX_SNOOZE_MS) {
+      throw new Error("Roadmap snooze must end in the future within 366 days.");
+    }
+    const snapshot = await loadGithubSnapshot(true);
+    const item = snapshot.items.find(
+      (candidate) =>
+        candidate.kind === "issue" &&
+        githubItemKey(candidate) === itemKey &&
+        candidate.state.toLowerCase() === "open" &&
+        !(snapshot.links[itemKey]?.length),
+    );
+    if (!item) {
+      throw new Error("Only an open, unstarted roadmap issue can be snoozed.");
+    }
+    const snoozes = await readRoadmapSnoozes();
+    snoozes[itemKey] = wakeAt;
+    await bb.storage.kv.set(ROADMAP_SNOOZES_KEY, snoozes);
+    bb.realtime.publish("board-changed", {
+      itemKey,
+      wakeAt,
+      event: "roadmap.snoozed",
+    });
+  }
+
+  async function wakeRoadmapItem(itemKey: string) {
+    const snoozes = await readRoadmapSnoozes();
+    delete snoozes[itemKey];
+    await bb.storage.kv.set(ROADMAP_SNOOZES_KEY, snoozes);
+    bb.realtime.publish("board-changed", {
+      itemKey,
+      event: "roadmap.woken",
+    });
+  }
+
   bb.rpc.register(rpcContract, {
     listBoard: ({ projectId }) => listBoard(projectId),
     moveThread: ({ threadId, status }) =>
@@ -1999,6 +2269,17 @@ export default function plugin(bb: BbPluginApi) {
       await clearStatusOverride(threadId, "User restored automatic status");
       return { ok: true as const };
     },
+    snoozeRoadmapItem: async ({ itemKey, wakeAt }) => {
+      await snoozeRoadmapItem(itemKey, wakeAt);
+      return { ok: true as const };
+    },
+    wakeRoadmapItem: async ({ itemKey }) => {
+      await wakeRoadmapItem(itemKey);
+      return { ok: true as const };
+    },
+    clearClosedCards: async ({ projectId }) => ({
+      cleared: await clearClosedCards(projectId),
+    }),
   });
 
   bb.agents.registerTool({
@@ -2063,7 +2344,7 @@ export default function plugin(bb: BbPluginApi) {
         labels: z.array(z.string().min(1).max(80)).max(10).default([]),
       })
       .strict(),
-    execute: async ({ projectId, ...input }, { threadId }) => {
+    execute: async ({ projectId, ...input }, { threadId, signal }) => {
       const sourceThread = await bb.sdk.threads.get({ threadId });
       const isDriver = threadId === driverThreadIdCache;
       if (projectId && projectId !== sourceThread.projectId && !isDriver) {
@@ -2071,9 +2352,36 @@ export default function plugin(bb: BbPluginApi) {
           "Controller agents may capture work only in their current project.",
         );
       }
+      const targetProjectId = projectId ?? sourceThread.projectId;
+      const interaction = await bb.ui.requestInput(
+        {
+          threadId,
+          rendererId: "work-capture-approval",
+          title: "Capture tracker work",
+          payload: {
+            projectId: targetProjectId,
+            title: input.title,
+            description: input.description,
+            acceptanceCriteria: input.acceptanceCriteria,
+            labels: input.labels,
+          },
+          timeoutMs: 30 * 60 * 1_000,
+        },
+        { signal },
+      );
+      if (interaction.outcome === "cancelled") {
+        return "Work capture cancelled; no tracker item was created.";
+      }
+      const decision = z
+        .object({ approved: z.boolean() })
+        .strict()
+        .parse(interaction.value);
+      if (!decision.approved) {
+        return "Work capture declined; no tracker item was created.";
+      }
       const result = await captureWorkItem(input, {
         id: sourceThread.id,
-        projectId: projectId ?? sourceThread.projectId,
+        projectId: targetProjectId,
         title:
           sourceThread.title ?? sourceThread.titleFallback ?? sourceThread.id,
       });
@@ -2798,14 +3106,16 @@ export default function plugin(bb: BbPluginApi) {
   ];
 
   bb.agents.configure((context) => {
+    const hasChildTitle = [
+      "Autobahn planner",
+      "Autobahn adversarial plan review",
+      "Autobahn verification:",
+      "Autobahn validate:",
+    ].some((prefix) => context.thread.title?.startsWith(prefix));
     const isPluginChild =
       context.origin.pluginId === bb.pluginId &&
-      [
-        "Autobahn planner",
-        "Autobahn adversarial plan review",
-        "Autobahn verification:",
-        "Autobahn validate:",
-      ].some((prefix) => context.thread.title?.startsWith(prefix));
+      (isolatedChildThreadIds.has(context.thread.id) ||
+        (context.thread.parentThreadId !== null && hasChildTitle));
     if (isPluginChild) {
       return {
         tools: [],

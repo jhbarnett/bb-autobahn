@@ -19,42 +19,66 @@
     ]
   },
   "dependencies": {
-    "@hugeicons/core-free-icons": "^4.1.3",
-    "@hugeicons/react": "^1.1.6",
-    "@radix-ui/react-dialog": "^1.1.23",
-    "@radix-ui/react-slot": "^1.3.0",
-    "class-variance-authority": "^0.7.1",
-    "clsx": "^2.1.1",
-    "lucide-react": "^1.32.0",
-    "tailwind-merge": "^3.4.0",
-    "zod": "^4.3.6"
+    "@hugeicons/core-free-icons": "4.2.3",
+    "@hugeicons/react": "1.1.9",
+    "@radix-ui/react-dialog": "1.1.23",
+    "@radix-ui/react-slot": "1.3.3",
+    "class-variance-authority": "0.7.1",
+    "clsx": "2.1.1",
+    "lucide-react": "1.32.0",
+    "tailwind-merge": "3.6.0",
+    "zod": "4.4.3"
   },
   "devDependencies": {
     "@get-bb/plugin-sdk": "0.4.6",
-    "@testing-library/react": "^16.3.2",
-    "@types/better-sqlite3": "^7.6.12",
-    "@types/node": "^22.0.0",
-    "@types/react": "^19.0.0",
-    "@types/react-dom": "^19.0.0",
-    "better-sqlite3": "^12.0.0",
-    "cron-parser": "^5.10.0",
-    "hono": "^4.11.9",
-    "jsdom": "^30.0.1",
-    "react": "^19.2.8",
-    "react-dom": "^19.2.8",
-    "sonner": "^2.0.8",
-    "typescript": "^5.7.0",
-    "vitest": "^4.1.11"
+    "@testing-library/react": "16.3.2",
+    "@types/better-sqlite3": "7.6.13",
+    "@types/node": "22.20.1",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.4",
+    "better-sqlite3": "12.11.1",
+    "cron-parser": "5.10.0",
+    "hono": "4.13.3",
+    "jsdom": "30.0.1",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "sonner": "2.0.8",
+    "typescript": "5.9.3",
+    "vitest": "4.1.11",
+    "bb-app": "0.38.0"
   },
   "scripts": {
     "build": "bb plugin build",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "check": "npm run typecheck && npm test && npm run build",
+    "prepack": "npm run build"
   },
   "files": [
-    "dist",
+    "dist/server.js",
+    "dist/server.meta.json",
+    "dist/app.js",
+    "dist/app.css",
+    "dist/app.meta.json",
     "README.md",
+    "SECURITY.md",
     "skills",
     "assets"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jhbarnett/bb-autobahn.git"
+  },
+  "homepage": "https://github.com/jhbarnett/bb-autobahn#readme",
+  "bugs": {
+    "url": "https://github.com/jhbarnett/bb-autobahn/issues"
+  },
+  "keywords": [
+    "bb",
+    "bb-plugin",
+    "agents",
+    "kanban",
+    "workflow",
+    "github"
   ]
 }

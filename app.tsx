@@ -337,9 +337,23 @@ function AutobahnCard({
   );
 }
 
-function RoadmapCard({ item }: { item: RoadmapItem }) {
+function RoadmapCard({
+  item,
+  snoozing,
+  onSnooze,
+}: {
+  item: RoadmapItem;
+  snoozing: boolean;
+  onSnooze: (itemKey: string, wakeAt: number) => void;
+}) {
   const navigate = useBbNavigate();
+  const [showSnooze, setShowSnooze] = useState(false);
+  const [customWake, setCustomWake] = useState("");
   const priority = item.priority <= 3 ? `P${item.priority}` : null;
+  const snoozeFor = (durationMs: number) => {
+    setShowSnooze(false);
+    onSnooze(item.id, Date.now() + durationMs);
+  };
   const title = (
     <span className="line-clamp-2 text-left text-xs font-semibold leading-4 text-card-foreground">
       {item.title}
@@ -368,10 +382,27 @@ function RoadmapCard({ item }: { item: RoadmapItem }) {
             {title}
           </a>
         )}
+        <button
+          type="button"
+          disabled={snoozing}
+          aria-label={`Snooze ${item.title}`}
+          onClick={() => setShowSnooze((current) => !current)}
+          className="shrink-0 rounded p-0.5 text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-50"
+        >
+          <Icon
+            name={snoozing ? "Spinner" : "Clock"}
+            className={cn("size-3.5", snoozing && "animate-spin")}
+            aria-hidden="true"
+          />
+        </button>
         <Icon name="Github" className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
       </div>
       <div className="mt-1.5 flex items-center gap-1.5 text-[10px] text-muted-foreground">
-        {priority ? (
+        {item.captured ? (
+          <span className="rounded bg-primary px-1 py-0.5 font-semibold text-primary-foreground">
+            Captured
+          </span>
+        ) : priority ? (
           <span className="rounded bg-foreground px-1 py-0.5 font-semibold text-background">
             {priority}
           </span>
@@ -381,6 +412,44 @@ function RoadmapCard({ item }: { item: RoadmapItem }) {
         </a>
         {item.linkedThreadId ? <span className="ml-auto">Thread linked</span> : null}
       </div>
+      {showSnooze ? (
+        <div className="mt-2 space-y-1.5 border-t border-border pt-1.5 text-[10px]">
+          <div className="flex gap-1">
+            <Button size="sm" variant="outline" className="h-6 px-1.5 text-[10px]" onClick={() => snoozeFor(24 * 60 * 60 * 1_000)}>
+              1 day
+            </Button>
+            <Button size="sm" variant="outline" className="h-6 px-1.5 text-[10px]" onClick={() => snoozeFor(3 * 24 * 60 * 60 * 1_000)}>
+              3 days
+            </Button>
+            <Button size="sm" variant="outline" className="h-6 px-1.5 text-[10px]" onClick={() => snoozeFor(7 * 24 * 60 * 60 * 1_000)}>
+              1 week
+            </Button>
+          </div>
+          <div className="flex gap-1">
+            <input
+              type="datetime-local"
+              value={customWake}
+              aria-label={`Custom wake time for ${item.title}`}
+              onChange={(event) => setCustomWake(event.target.value)}
+              className="min-w-0 flex-1 rounded border border-border bg-background px-1 py-0.5 text-[10px]"
+            />
+            <Button
+              size="sm"
+              className="h-6 px-1.5 text-[10px]"
+              disabled={!customWake}
+              onClick={() => {
+                const wakeAt = new Date(customWake).getTime();
+                if (Number.isFinite(wakeAt)) {
+                  setShowSnooze(false);
+                  onSnooze(item.id, wakeAt);
+                }
+              }}
+            >
+              Apply
+            </Button>
+          </div>
+        </div>
+      ) : null}
     </article>
   );
 }
@@ -390,17 +459,29 @@ function LaneSection({
   roadmapItems,
   movingThreadId,
   clearingOverrideId,
+  snoozingItemId,
+  snoozedCount,
+  clearingClosed,
   onMove,
   onClearOverride,
+  onSnoozeRoadmap,
+  onClearClosed,
 }: {
   lane: Lane;
   roadmapItems: RoadmapItem[];
   movingThreadId: string | null;
   clearingOverrideId: string | null;
+  snoozingItemId: string | null;
+  snoozedCount: number;
+  clearingClosed: boolean;
   onMove: (threadId: string, status: BoardStatus) => void;
   onClearOverride: (threadId: string) => void;
+  onSnoozeRoadmap: (itemKey: string, wakeAt: number) => void;
+  onClearClosed: () => void;
 }) {
   const [dragOver, setDragOver] = useState(false);
+  const [roadmapExpanded, setRoadmapExpanded] = useState(false);
+  const [collapsed, setCollapsed] = useState(lane.status === "CLOSED");
 
   return (
     <section
@@ -437,27 +518,103 @@ function LaneSection({
         <span className="text-[11px] text-muted-foreground">
           {STATUS_LABELS[lane.status]}
         </span>
-      </div>
-
-      <div className="flex min-h-24 gap-2 overflow-x-auto px-1 py-2">
-        {roadmapItems.map((item) => (
-          <RoadmapCard key={item.id} item={item} />
-        ))}
-        {lane.cards.map((card) => (
-          <AutobahnCard
-            key={card.id}
-            card={card}
-            moving={movingThreadId === card.id}
-            clearingOverride={clearingOverrideId === card.id}
-            onClearOverride={onClearOverride}
-          />
-        ))}
-        {lane.cards.length === 0 && roadmapItems.length === 0 ? (
-          <div className="flex min-h-20 w-full items-center justify-center rounded-lg border border-dashed border-border text-[11px] text-muted-foreground">
-            Drop a thread here
+        {lane.status === "OPEN" && snoozedCount > 0 ? (
+          <span className="text-[10px] text-muted-foreground">
+            {snoozedCount} snoozed
+          </span>
+        ) : null}
+        {lane.status === "OPEN" && roadmapItems.length ? (
+          <button
+            type="button"
+            aria-expanded={roadmapExpanded}
+            aria-label={
+              roadmapExpanded
+                ? "Collapse Open roadmap"
+                : "Expand Open roadmap"
+            }
+            onClick={() => setRoadmapExpanded((current) => !current)}
+            className="ml-auto inline-flex items-center gap-1 rounded px-1.5 py-1 text-[10px] font-medium text-muted-foreground hover:bg-accent hover:text-foreground"
+          >
+            {roadmapExpanded ? "1 row" : "3 rows"}
+            <Icon
+              name={roadmapExpanded ? "ChevronUp" : "ChevronDown"}
+              className="size-3"
+              aria-hidden="true"
+            />
+          </button>
+        ) : null}
+        {lane.status === "CLOSED" ? (
+          <div className="ml-auto flex items-center gap-1">
+            <button
+              type="button"
+              disabled={clearingClosed || lane.cards.length === 0}
+              aria-label="Clear Closed cards"
+              onClick={onClearClosed}
+              className="inline-flex items-center rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-40"
+            >
+              <Icon
+                name={clearingClosed ? "Spinner" : "Clean"}
+                className={cn("size-3.5", clearingClosed && "animate-spin")}
+                aria-hidden="true"
+              />
+            </button>
+            <button
+              type="button"
+              aria-expanded={!collapsed}
+              aria-label={collapsed ? "Expand Closed lane" : "Collapse Closed lane"}
+              onClick={() => setCollapsed((current) => !current)}
+              className="inline-flex items-center gap-1 rounded px-1.5 py-1 text-[10px] font-medium text-muted-foreground hover:bg-accent hover:text-foreground"
+            >
+              {collapsed ? "Show" : "Hide"}
+              <Icon
+                name={collapsed ? "ChevronDown" : "ChevronUp"}
+                className="size-3"
+                aria-hidden="true"
+              />
+            </button>
           </div>
         ) : null}
       </div>
+
+      {!collapsed ? (
+        <div className="space-y-2 px-1 py-2">
+          {roadmapItems.length ? (
+            <div
+              className={cn(
+                "grid auto-cols-[15rem] grid-flow-col gap-2 overflow-x-auto",
+                roadmapExpanded ? "grid-rows-3" : "grid-rows-1",
+              )}
+            >
+              {roadmapItems.map((item) => (
+                <RoadmapCard
+                  key={item.id}
+                  item={item}
+                  snoozing={snoozingItemId === item.id}
+                  onSnooze={onSnoozeRoadmap}
+                />
+              ))}
+            </div>
+          ) : null}
+          {lane.cards.length > 0 || roadmapItems.length === 0 ? (
+            <div className="flex min-h-24 gap-2 overflow-x-auto">
+              {lane.cards.map((card) => (
+                <AutobahnCard
+                  key={card.id}
+                  card={card}
+                  moving={movingThreadId === card.id}
+                  clearingOverride={clearingOverrideId === card.id}
+                  onClearOverride={onClearOverride}
+                />
+              ))}
+              {lane.cards.length === 0 ? (
+                <div className="flex min-h-20 w-full items-center justify-center rounded-lg border border-dashed border-border text-[11px] text-muted-foreground">
+                  Drop a thread here
+                </div>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
     </section>
   );
 }
@@ -470,6 +627,8 @@ function AutobahnBoard() {
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [movingThreadId, setMovingThreadId] = useState<string | null>(null);
   const [clearingOverrideId, setClearingOverrideId] = useState<string | null>(null);
+  const [snoozingItemId, setSnoozingItemId] = useState<string | null>(null);
+  const [clearingClosed, setClearingClosed] = useState(false);
   const [needsYouOnly, setNeedsYouOnly] = useState(false);
   const mounted = useRef(true);
   const previousConnection = useRef(connectionState);
@@ -566,6 +725,45 @@ function AutobahnBoard() {
     [clearingOverrideId, loadBoard, rpc],
   );
 
+  const snoozeRoadmap = useCallback(
+    async (itemKey: string, wakeAt: number) => {
+      if (snoozingItemId) return;
+      setSnoozingItemId(itemKey);
+      try {
+        await rpc.call("snoozeRoadmapItem", { itemKey, wakeAt });
+        toast.success("Roadmap item snoozed");
+        await loadBoard(true);
+      } catch (caught) {
+        toast.error(
+          caught instanceof Error ? caught.message : "Could not snooze item",
+        );
+      } finally {
+        if (mounted.current) setSnoozingItemId(null);
+      }
+    },
+    [loadBoard, rpc, snoozingItemId],
+  );
+
+  const clearClosed = useCallback(async () => {
+    if (clearingClosed) return;
+    setClearingClosed(true);
+    try {
+      const result = await rpc.call("clearClosedCards", {});
+      toast.success(
+        result.cleared === 1
+          ? "Cleared 1 Closed card"
+          : `Cleared ${result.cleared} Closed cards`,
+      );
+      await loadBoard(true);
+    } catch (caught) {
+      toast.error(
+        caught instanceof Error ? caught.message : "Could not clear Closed cards",
+      );
+    } finally {
+      if (mounted.current) setClearingClosed(false);
+    }
+  }, [clearingClosed, loadBoard, rpc]);
+
   const attentionReasons = useMemo<WorkflowAttentionSummary[]>(() => {
     const counts = new Map<string, number>();
     for (const lane of board?.lanes ?? []) {
@@ -656,8 +854,13 @@ function AutobahnBoard() {
             }
             movingThreadId={movingThreadId}
             clearingOverrideId={clearingOverrideId}
+            snoozingItemId={snoozingItemId}
+            snoozedCount={lane.status === "OPEN" ? (board?.snoozedCount ?? 0) : 0}
+            clearingClosed={clearingClosed}
             onMove={moveCard}
             onClearOverride={clearOverride}
+            onSnoozeRoadmap={snoozeRoadmap}
+            onClearClosed={clearClosed}
           />
         ))}
       </div>
@@ -736,6 +939,90 @@ function PlanApprovalInteraction({
           }
         >
           Approve plan
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+function WorkCaptureApprovalInteraction({
+  interaction,
+  submit,
+  cancel,
+}: PluginPendingInteractionProps) {
+  const payload =
+    interaction.payload &&
+    typeof interaction.payload === "object" &&
+    !Array.isArray(interaction.payload)
+      ? interaction.payload
+      : {};
+  const title =
+    "title" in payload && typeof payload.title === "string"
+      ? payload.title
+      : "Untitled work item";
+  const description =
+    "description" in payload && typeof payload.description === "string"
+      ? payload.description
+      : "";
+  const projectId =
+    "projectId" in payload && typeof payload.projectId === "string"
+      ? payload.projectId
+      : "current project";
+  const acceptanceCriteria =
+    "acceptanceCriteria" in payload &&
+    Array.isArray(payload.acceptanceCriteria)
+      ? payload.acceptanceCriteria.filter(
+          (item): item is string => typeof item === "string",
+        )
+      : [];
+  const labels =
+    "labels" in payload && Array.isArray(payload.labels)
+      ? payload.labels.filter((item): item is string => typeof item === "string")
+      : [];
+
+  return (
+    <div className="space-y-3 rounded-lg border border-border bg-card p-3">
+      <div>
+        <p className="text-xs font-semibold text-foreground">
+          Capture this work in the issue tracker?
+        </p>
+        <p className="mt-1 text-xs font-medium text-foreground">{title}</p>
+        {description ? (
+          <p className="mt-1 whitespace-pre-wrap text-xs text-muted-foreground">
+            {description}
+          </p>
+        ) : null}
+      </div>
+      <div className="space-y-1 text-[11px] text-muted-foreground">
+        <p>Project: {projectId}</p>
+        {acceptanceCriteria.length ? (
+          <div>
+            <p className="font-medium text-foreground">Acceptance criteria</p>
+            <ul className="list-disc pl-4">
+              {acceptanceCriteria.map((criterion) => (
+                <li key={criterion}>{criterion}</li>
+              ))}
+            </ul>
+          </div>
+        ) : null}
+        {labels.length ? <p>Labels: {labels.join(", ")}</p> : null}
+      </div>
+      <div className="flex justify-end gap-2">
+        <Button variant="ghost" size="sm" onClick={() => void cancel()}>
+          Cancel
+        </Button>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => void submit({ approved: false })}
+        >
+          Not now
+        </Button>
+        <Button
+          size="sm"
+          onClick={() => void submit({ approved: true })}
+        >
+          Capture work
         </Button>
       </div>
     </div>
@@ -840,6 +1127,10 @@ export default definePluginApp((app) => {
   app.slots.pendingInteraction({
     id: "plan-approval",
     component: PlanApprovalInteraction,
+  });
+  app.slots.pendingInteraction({
+    id: "work-capture-approval",
+    component: WorkCaptureApprovalInteraction,
   });
   app.slots.navPanel({
     id: "autobahn-board",
