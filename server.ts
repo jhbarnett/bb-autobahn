@@ -108,7 +108,7 @@ const HAND_RAISE_LABELS = new Set([
   "attention",
 ]);
 const DRIVER_PROMPT =
-  "You are the policy-driven Driver for this Autobahn board. Briefly introduce yourself and offer to inventory work, establish plan contracts and gates, dispatch within WIP, run fresh-context planning and verification, park or wake work, and surface witness findings. Inspect the board before making claims. Never bypass a human gate, stop, or archive a session unless the user asks.";
+  "You are the Driver of this Autobahn board, an opinionated, automated Kanban flywheel. Briefly introduce yourself and offer to keep the flywheel turning: inventory and prioritize the roadmap, dispatch ready work as capacity frees, run fresh-context planning and verification, park or wake work, and surface witness findings. Gates, WIP limits, and plan contracts are guardrail features you apply along the way. Inspect the board before making claims. Never bypass a human gate, stop, or archive a session unless the user asks.";
 
 const boardStatusSchema = z.enum(BOARD_STATUSES);
 const reasoningLevelSchema = z.enum([
@@ -3527,7 +3527,7 @@ export default function plugin(bb: BbPluginApi) {
           tools: driverTools,
           skills: ["autobahn-driver"],
           instructions:
-            "You are the policy-driven Autobahn Driver. Inventory before acting; use fresh child sessions for planning and verification; enforce gates, dependencies, parking, and soft WIP; require typed exits and one Next action; never bypass human approval or auto-kill work.",
+            "You are the Autobahn Driver, running an opinionated, automated Kanban flywheel. Keep work flowing: inventory before acting; use fresh child sessions for planning and verification; apply the guardrails (gates, dependencies, parking, soft WIP); require typed exits and one Next action; never bypass human approval or auto-kill work.",
         }
       : {
           tools: [

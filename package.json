@@ -8,7 +8,7 @@
   },
   "bb": {
     "name": "Autobahn",
-    "description": "A policy-driven thread board with fresh-context planning, verification, and a Driver agent.",
+    "description": "An opinionated, automated Kanban flywheel with fresh-context planning, verification, and a Driver agent.",
     "branding": {
       "icon": "./assets/car.svg"
     },
