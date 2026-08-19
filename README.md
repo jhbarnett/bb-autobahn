@@ -8,17 +8,34 @@ passes.
 
 The board uses bb thread sections as its coarse state:
 
-1. `TODO`
+1. `OPEN`
 2. `WIP`
 3. `R4R`
-4. `DONE`
+4. `CLOSED`
 
-Workflow metadata is orthogonal to those columns. Cards show phase, gate, risk,
-priority, evidence and concern counts, one required `Next:` action, native bb
-or PR attention, project, harness, model, context usage, and external links.
+Open is both the task list and the start of the thread workflow. Autobahn reads
+open issues from the installed GitHub plugin, ranks common P0 through P3 labels
+ahead of unlabeled work, and shows the configured top five issues by default.
+Open controller threads render as ordinary cards; the compact roadmap cards are
+reserved for unstarted issues, link to GitHub, and can be turned into stopped
+Open sessions by the Driver.
+
+Closed follows external work state. A linked issue or pull request closing or
+merging moves its card to Closed. If external work reopens, an unverified card
+returns to Open and a verified card returns to R4R. Autobahn checks this on board
+loads and every five minutes.
+
+A user drag or Driver move is an explicit, durable status override, so a closed
+PR never has to mean the thread is finished. The small `Auto` control on an
+overridden card, or the Driver clear-override tool, restores external automation
+and immediately reconciles the current GitHub state.
+
+Workflow metadata is orthogonal to those sections. Cards show phase, gate, risk,
+priority, evidence and concern counts, one required `Next:` action, native bb or
+PR attention, project, harness logo, model, context usage, and external links.
 The Needs You filter isolates blocked, approval, review, runtime, staleness, and
 consistency signals. WIP and R4R limits are soft settings: the UI warns and the
-Chief dispatches only into available capacity.
+Driver dispatches only into available capacity.
 
 ## Workflow
 
@@ -28,26 +45,28 @@ Chief dispatches only into available capacity.
   children use disposable managed worktrees and receive no Autobahn mutation
   tools, so they cannot alter the controller worktree.
 - High and critical risk plans require explicit human approval.
-- Every station exits through `autobahn_report_exit` with
-  `DONE | DONE_WITH_CONCERNS | NEEDS_CONTEXT | BLOCKED`, evidence, concerns,
-  and one next action.
+- Every station exits through `autobahn_report_exit` with the internal typed
+  result `DONE | DONE_WITH_CONCERNS | NEEDS_CONTEXT | BLOCKED`, evidence,
+  concerns, and one next action. These results are separate from the Closed lane.
 - Verification fans out fresh-context lenses, then starts a fresh validator for
   every finding. Rejected findings are dropped.
-- Successful build work advances to verification, not directly to DONE.
+- Successful build work advances to verification, not directly to Closed.
 - Parking supports timers, dependencies, pending interactions, PR merges, and
   check completion. Parked cards do not consume WIP.
 - A scheduled wake pass surfaces satisfied conditions. A witness pass reports
   stale or inconsistent work and never kills it.
-- Current workflow state and an append-only event ledger live in the plugin
-  database; bb threads, environments, and PR state remain authoritative for
-  execution.
+- Current workflow state, manual status provenance, and an append-only event
+  ledger live in the plugin database; bb threads, environments, and GitHub state
+  remain authoritative for execution.
 
-## Chief of Staff
+## Driver
 
-The board header opens a persistent Chief thread in a right-side panel. It can
-inventory, create, assign, contract, plan, approve, verify, dispatch, move,
-park, wake, witness, stop, archive, and unarchive sessions. Its hidden runtime
-is released whenever idle and resumes on the next message.
+The steering-wheel button in the board header opens a persistent Driver thread
+in a right-side panel. It can inventory, create, assign, contract, plan, approve,
+verify, dispatch, move, park, wake, witness, stop, archive, and unarchive sessions.
+It can also start prioritized roadmap issues and set or clear explicit status
+overrides. Its hidden runtime is released whenever idle and resumes on the next
+message.
 
 ## Development
 

@@ -10,8 +10,8 @@ import type { BoardResult } from "./server";
 const board: BoardResult = {
   lanes: [
     {
-      status: "TODO",
-      sectionId: "section-TODO",
+      status: "OPEN",
+      sectionId: "section-OPEN",
       softLimit: null,
       overLimit: false,
       capacityCount: 0,
@@ -63,6 +63,9 @@ const board: BoardResult = {
             blockedBy: [],
             parkedWake: null,
             phaseStartedAt: 30,
+            statusOverride: "WIP",
+            statusOverrideReason: "Keep active while the follow-up issue remains",
+            statusOverrideAt: 40,
           },
           attention: ["review-requested"],
           updatedAt: 42,
@@ -78,12 +81,26 @@ const board: BoardResult = {
       cards: [],
     },
     {
-      status: "DONE",
-      sectionId: "section-DONE",
+      status: "CLOSED",
+      sectionId: "section-CLOSED",
       softLimit: null,
       overLimit: false,
       capacityCount: 0,
       cards: [],
+    },
+  ],
+  roadmapItems: [
+    {
+      id: "issue:acme/repo#42",
+      repo: "acme/repo",
+      number: 42,
+      title: "Top roadmap issue",
+      url: "https://github.com/acme/repo/issues/42",
+      labels: ["P0"],
+      priority: 0,
+      updatedAt: "2026-08-19T00:00:00Z",
+      projectId: "project-1",
+      linkedThreadId: null,
     },
   ],
   needsYouCount: 1,
@@ -95,6 +112,7 @@ describe("autobahn panel", () => {
       threadId,
       status,
     }));
+    const clearStatusOverride = vi.fn(() => ({ ok: true as const }));
     const app = await loadPluginApp(() => import("./app"));
     const slot = renderSlot(
       app.navPanels[0]!,
@@ -106,15 +124,18 @@ describe("autobahn panel", () => {
             ...moveThread(input),
             warning: null,
           }),
-          getChiefOfStaff: () => ({ threadId: "chief-thread" }),
+          getDriver: () => ({ threadId: "driver-thread" }),
+          clearStatusOverride,
         },
       },
     );
 
     expect(
       (await slot.findAllByRole("heading")).map((node) => node.textContent),
-    ).toEqual(["TODO", "WIP", "R4R", "DONE"]);
+    ).toEqual(["OPEN", "WIP", "R4R", "CLOSED"]);
     expect(slot.getByText("Ship feature")).toBeTruthy();
+    expect(slot.getByText("Top roadmap issue")).toBeTruthy();
+    expect(slot.getByRole("link", { name: "acme/repo#42" })).toBeTruthy();
     expect(slot.queryByText("codex")).toBeNull();
     expect(
       slot.container.querySelector('[data-icon="ChatGPT"]'),
@@ -134,6 +155,10 @@ describe("autobahn panel", () => {
     expect(slot.getByLabelText("WIP: 1 of 3")).toBeTruthy();
     expect(slot.getByLabelText("Attention: Review requested")).toBeTruthy();
     expect(slot.getByText("Agentbox")).toBeTruthy();
+    fireEvent.click(slot.getByRole("button", { name: "Auto" }));
+    await vi.waitFor(() => {
+      expect(clearStatusOverride).toHaveBeenCalledWith({ threadId: "thread-1" });
+    });
     expect(
       slot.getByRole("link", { name: "PR #17" }).getAttribute("href"),
     ).toBe("https://github.com/acme/repo/pull/17");
@@ -165,7 +190,7 @@ describe("autobahn panel", () => {
     slot.lifecycle.unmount();
   });
 
-  it("opens and closes the persistent Chief of Staff thread in a side panel", async () => {
+  it("opens and closes the persistent Driver thread in a side panel", async () => {
     const app = await loadPluginApp(() => import("./app"));
     const header = renderSlot(
       { component: app.navPanels[0]!.headerContent! },
@@ -178,25 +203,25 @@ describe("autobahn panel", () => {
             status,
             warning: null,
           }),
-          getChiefOfStaff: () => ({ threadId: "chief-thread" }),
+          getDriver: () => ({ threadId: "driver-thread" }),
         },
       },
     );
 
     fireEvent.click(
-      header.getByRole("button", { name: "Open Autobahn Chief of Staff" }),
+      header.getByRole("button", { name: "Open Autobahn Driver" }),
     );
 
     const panel = await screen.findByRole("dialog");
     expect(
-      screen.getByRole("heading", { name: "Autobahn Chief of Staff" }),
+      screen.getByRole("heading", { name: "Autobahn Driver" }),
     ).toBeTruthy();
     expect(panel.textContent).toContain(
       "Plan, dispatch, verify, gate, park, and witness coding sessions.",
     );
 
     const chat = await screen.findByTestId("bb-thread-chat");
-    expect(chat.getAttribute("data-thread-id")).toBe("chief-thread");
+    expect(chat.getAttribute("data-thread-id")).toBe("driver-thread");
     expect(chat.getAttribute("data-variant")).toBe("compact");
     expect(chat.getAttribute("data-layout")).toBe("contained");
 
@@ -207,7 +232,7 @@ describe("autobahn panel", () => {
     header.lifecycle.unmount();
   });
 
-  it("requires an explicit human plan decision through the Chief interaction", async () => {
+  it("requires an explicit human plan decision through the Driver interaction", async () => {
     const app = await loadPluginApp(() => import("./app"));
     const submit = vi.fn(async () => undefined);
     const cancel = vi.fn(async () => undefined);
@@ -216,7 +241,7 @@ describe("autobahn panel", () => {
       {
         interaction: {
           id: "interaction-1",
-          threadId: "chief-thread",
+          threadId: "driver-thread",
           title: "Autobahn plan approval",
           payload: {
             cardThreadId: "thread-1",

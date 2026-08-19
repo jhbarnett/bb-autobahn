@@ -32,23 +32,24 @@ import {
 } from "@/components/workflow-meta";
 import { cn } from "@/lib/utils";
 
-const BOARD_STATUSES = ["TODO", "WIP", "R4R", "DONE"] as const;
+const BOARD_STATUSES = ["OPEN", "WIP", "R4R", "CLOSED"] as const;
 type Lane = BoardResult["lanes"][number];
 type Card = Lane["cards"][number];
+type RoadmapItem = BoardResult["roadmapItems"][number];
 type BoardStatus = (typeof BOARD_STATUSES)[number];
 
 const STATUS_LABELS: Record<BoardStatus, string> = {
-  TODO: "Todo",
+  OPEN: "Open",
   WIP: "Work in progress",
   R4R: "Ready for review",
-  DONE: "Done",
+  CLOSED: "Closed",
 };
 
 const STATUS_DOT: Record<BoardStatus, string> = {
-  TODO: "bg-muted-foreground/60",
+  OPEN: "bg-muted-foreground/60",
   WIP: "bg-primary",
   R4R: "bg-foreground",
-  DONE: "bg-primary/70",
+  CLOSED: "bg-primary/70",
 };
 
 function contextPercent(card: Card) {
@@ -91,9 +92,13 @@ function compactLinkLabel(card: Card, label: string) {
 function AutobahnCard({
   card,
   moving,
+  clearingOverride,
+  onClearOverride,
 }: {
   card: Card;
   moving: boolean;
+  clearingOverride: boolean;
+  onClearOverride: (threadId: string) => void;
 }) {
   const navigate = useBbNavigate();
   const context = contextPercent(card);
@@ -169,6 +174,25 @@ function AutobahnCard({
             priority={workflowPriority(card.workflow.priority)}
             risk={card.workflow.riskClass}
           />
+          {card.workflow.statusOverride ? (
+            <button
+              type="button"
+              disabled={clearingOverride}
+              onClick={(event) => {
+                event.stopPropagation();
+                onClearOverride(card.id);
+              }}
+              className="inline-flex shrink-0 items-center gap-0.5 rounded border border-border px-1 py-0.5 text-[9px] font-medium text-muted-foreground hover:bg-accent hover:text-foreground disabled:opacity-50"
+              title={card.workflow.statusOverrideReason ?? "Manual board status"}
+            >
+              <Icon
+                name={clearingOverride ? "Spinner" : "RotateCcw"}
+                className={cn("size-2.5", clearingOverride && "animate-spin")}
+                aria-hidden="true"
+              />
+              Auto
+            </button>
+          ) : null}
           <EvidenceConcernsIndicator
             evidenceCount={card.workflow.evidence.length}
             concernsCount={card.workflow.concerns.length}
@@ -225,14 +249,67 @@ function AutobahnCard({
   );
 }
 
+function RoadmapCard({ item }: { item: RoadmapItem }) {
+  const navigate = useBbNavigate();
+  const priority = item.priority <= 3 ? `P${item.priority}` : null;
+  const title = (
+    <span className="line-clamp-2 text-left text-xs font-semibold leading-4 text-card-foreground">
+      {item.title}
+    </span>
+  );
+
+  return (
+    <article className="flex w-60 shrink-0 flex-col rounded-lg border border-dashed border-border bg-muted/30 px-2.5 py-2 shadow-sm">
+      <div className="flex items-start gap-1.5">
+        {item.linkedThreadId ? (
+          <button
+            type="button"
+            onClick={() => navigate.toThread(item.linkedThreadId!)}
+            className="min-w-0 flex-1 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {title}
+          </button>
+        ) : (
+          <a
+            href={item.url}
+            target="_blank"
+            rel="noreferrer"
+            className="min-w-0 flex-1 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {title}
+          </a>
+        )}
+        <Icon name="Github" className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+      </div>
+      <div className="mt-1.5 flex items-center gap-1.5 text-[10px] text-muted-foreground">
+        {priority ? (
+          <span className="rounded bg-foreground px-1 py-0.5 font-semibold text-background">
+            {priority}
+          </span>
+        ) : null}
+        <a href={item.url} target="_blank" rel="noreferrer" className="truncate hover:underline">
+          {item.repo}#{item.number}
+        </a>
+        {item.linkedThreadId ? <span className="ml-auto">Thread linked</span> : null}
+      </div>
+    </article>
+  );
+}
+
 function LaneSection({
   lane,
+  roadmapItems,
   movingThreadId,
+  clearingOverrideId,
   onMove,
+  onClearOverride,
 }: {
   lane: Lane;
+  roadmapItems: RoadmapItem[];
   movingThreadId: string | null;
+  clearingOverrideId: string | null;
   onMove: (threadId: string, status: BoardStatus) => void;
+  onClearOverride: (threadId: string) => void;
 }) {
   const [dragOver, setDragOver] = useState(false);
 
@@ -275,19 +352,23 @@ function LaneSection({
       </div>
 
       <div className="flex min-h-24 gap-2 overflow-x-auto px-1 py-2">
-        {lane.cards.length === 0 ? (
+        {roadmapItems.map((item) => (
+          <RoadmapCard key={item.id} item={item} />
+        ))}
+        {lane.cards.map((card) => (
+          <AutobahnCard
+            key={card.id}
+            card={card}
+            moving={movingThreadId === card.id}
+            clearingOverride={clearingOverrideId === card.id}
+            onClearOverride={onClearOverride}
+          />
+        ))}
+        {lane.cards.length === 0 && roadmapItems.length === 0 ? (
           <div className="flex min-h-20 w-full items-center justify-center rounded-lg border border-dashed border-border text-[11px] text-muted-foreground">
             Drop a thread here
           </div>
-        ) : (
-          lane.cards.map((card) => (
-            <AutobahnCard
-              key={card.id}
-              card={card}
-              moving={movingThreadId === card.id}
-            />
-          ))
-        )}
+        ) : null}
       </div>
     </section>
   );
@@ -300,6 +381,7 @@ function AutobahnBoard() {
   const [error, setError] = useState<string | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [movingThreadId, setMovingThreadId] = useState<string | null>(null);
+  const [clearingOverrideId, setClearingOverrideId] = useState<string | null>(null);
   const [needsYouOnly, setNeedsYouOnly] = useState(false);
   const mounted = useRef(true);
   const previousConnection = useRef(connectionState);
@@ -373,6 +455,27 @@ function AutobahnBoard() {
       }
     },
     [cardStatuses, loadBoard, movingThreadId, rpc],
+  );
+
+  const clearOverride = useCallback(
+    async (threadId: string) => {
+      if (clearingOverrideId) return;
+      setClearingOverrideId(threadId);
+      try {
+        await rpc.call("clearStatusOverride", { threadId });
+        toast.success("Automatic external status restored");
+        await loadBoard(true);
+      } catch (caught) {
+        toast.error(
+          caught instanceof Error
+            ? caught.message
+            : "Could not restore automatic status",
+        );
+      } finally {
+        if (mounted.current) setClearingOverrideId(null);
+      }
+    },
+    [clearingOverrideId, loadBoard, rpc],
   );
 
   const attentionReasons = useMemo<WorkflowAttentionSummary[]>(() => {
@@ -455,8 +558,15 @@ function AutobahnBoard() {
           <LaneSection
             key={lane.status}
             lane={lane}
+            roadmapItems={
+              lane.status === "OPEN" && !needsYouOnly
+                ? (board?.roadmapItems ?? [])
+                : []
+            }
             movingThreadId={movingThreadId}
+            clearingOverrideId={clearingOverrideId}
             onMove={moveCard}
+            onClearOverride={clearOverride}
           />
         ))}
       </div>
@@ -541,7 +651,7 @@ function PlanApprovalInteraction({
   );
 }
 
-function ChiefOfStaffPanel() {
+function DriverPanel() {
   const rpc = useRpc<typeof rpcContract>();
   const [open, setOpen] = useState(false);
   const [threadId, setThreadId] = useState<string | null>(null);
@@ -549,18 +659,18 @@ function ChiefOfStaffPanel() {
   const [loading, setLoading] = useState(false);
   const [focusRequest, setFocusRequest] = useState(0);
 
-  const loadChief = useCallback(async () => {
+  const loadDriver = useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      const result = await rpc.call("getChiefOfStaff");
+      const result = await rpc.call("getDriver");
       setThreadId(result.threadId);
       setFocusRequest((current) => current + 1);
     } catch (caught) {
       setError(
         caught instanceof Error
           ? caught.message
-          : "Could not open the Chief of Staff",
+          : "Could not open the Driver",
       );
     } finally {
       setLoading(false);
@@ -569,11 +679,11 @@ function ChiefOfStaffPanel() {
 
   useEffect(() => {
     if (open && !threadId && !loading && !error) {
-      void loadChief();
+      void loadDriver();
     } else if (open && threadId) {
       setFocusRequest((current) => current + 1);
     }
-  }, [error, loadChief, loading, open, threadId]);
+  }, [error, loadDriver, loading, open, threadId]);
 
   return (
     <Sheet open={open} onOpenChange={setOpen}>
@@ -581,11 +691,11 @@ function ChiefOfStaffPanel() {
         <Button
           variant="ghost"
           size="sm"
-          aria-label="Open Autobahn Chief of Staff"
+          aria-label="Open Autobahn Driver"
           className="px-2"
         >
-          <Icon name="UserRound" className="size-4" aria-hidden="true" />
-          <span className="hidden sm:inline">Chief of Staff</span>
+          <Icon name="SteeringWheel" className="size-4" aria-hidden="true" />
+          <span className="hidden sm:inline">Driver</span>
         </Button>
       </SheetTrigger>
       <SheetContent
@@ -593,7 +703,7 @@ function ChiefOfStaffPanel() {
         className="flex w-[min(94vw,44rem)] max-w-none flex-col gap-0 p-0 sm:max-w-[44rem]"
       >
         <SheetHeader className="shrink-0 border-b border-border px-4 py-3 pr-12">
-          <SheetTitle className="text-sm">Autobahn Chief of Staff</SheetTitle>
+          <SheetTitle className="text-sm">Autobahn Driver</SheetTitle>
           <SheetDescription className="text-xs">
             Plan, dispatch, verify, gate, park, and witness coding sessions.
           </SheetDescription>
@@ -614,7 +724,7 @@ function ChiefOfStaffPanel() {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => void loadChief()}
+                onClick={() => void loadDriver()}
               >
                 Try again
               </Button>
@@ -646,6 +756,6 @@ export default definePluginApp((app) => {
     icon: "Car",
     path: "board",
     component: AutobahnBoard,
-    headerContent: ChiefOfStaffPanel,
+    headerContent: DriverPanel,
   });
 });

@@ -3,6 +3,7 @@ import { z } from "zod";
 import {
   EXIT_STATUSES,
   RISK_CLASSES,
+  STATUS_OVERRIDES,
   WORKFLOW_GATES,
   WORKFLOW_PHASES,
   WORKFLOW_STATE_MIGRATIONS,
@@ -18,13 +19,13 @@ import {
   type VerificationLens,
 } from "./orchestration";
 
-export const BOARD_STATUSES = ["TODO", "WIP", "R4R", "DONE"] as const;
+export const BOARD_STATUSES = ["OPEN", "WIP", "R4R", "CLOSED"] as const;
 
-const CHIEF_TITLE = "Autobahn Chief of Staff";
-const CHIEF_THREAD_KEY = "chief-of-staff-thread-id";
+const DRIVER_TITLE = "Autobahn Driver";
+const DRIVER_THREAD_KEY = "autobahn-driver-thread-id";
 const WITNESS_FINGERPRINT_KEY = "witness-last-fingerprint";
-const CHIEF_PROMPT =
-  "You are the policy-driven Chief of Staff for this Autobahn board board. Briefly introduce yourself and offer to inventory work, establish plan contracts and gates, dispatch within WIP, run fresh-context planning and verification, park or wake work, and surface witness findings. Inspect the board before making claims. Never bypass a human gate, stop, or archive a session unless the user asks.";
+const DRIVER_PROMPT =
+  "You are the policy-driven Driver for this Autobahn board. Briefly introduce yourself and offer to inventory work, establish plan contracts and gates, dispatch within WIP, run fresh-context planning and verification, park or wake work, and surface witness findings. Inspect the board before making claims. Never bypass a human gate, stop, or archive a session unless the user asks.";
 
 const boardStatusSchema = z.enum(BOARD_STATUSES);
 const reasoningLevelSchema = z.enum([
@@ -74,6 +75,7 @@ const planContractSchema = z.object({
   acceptanceCriteria: z.array(z.string()),
   verificationCommands: z.array(z.string()),
 });
+const statusOverrideSchema = z.enum(STATUS_OVERRIDES);
 const workflowStateSchema = z.object({
   phase: workflowPhaseSchema,
   gate: workflowGateSchema,
@@ -94,6 +96,74 @@ const workflowStateSchema = z.object({
     })
     .nullable(),
   phaseStartedAt: z.number(),
+  statusOverride: statusOverrideSchema.nullable(),
+  statusOverrideReason: z.string().nullable(),
+  statusOverrideAt: z.number().int().nonnegative().nullable(),
+});
+
+const githubItemSchema = z
+  .object({
+    repo: z.string(),
+    number: z.number().int().positive(),
+    kind: z.enum(["issue", "pr"]),
+    title: z.string(),
+    state: z.string(),
+    author: z.string(),
+    labels: z.array(z.string()),
+    assignees: z.array(z.string()),
+    url: z.string(),
+    body: z.string(),
+    updatedAt: z.string(),
+  })
+  .strict();
+const githubItemsOutputSchema = z
+  .object({ items: z.array(githubItemSchema) })
+  .strict();
+const githubLinkSchema = z
+  .object({
+    kind: z.enum(["issue", "pr"]),
+    repo: z.string(),
+    number: z.number().int().positive(),
+    threadId: z.string(),
+    createdAt: z.string(),
+  })
+  .strict();
+const githubLinksOutputSchema = z
+  .object({ links: z.record(z.string(), z.array(githubLinkSchema)) })
+  .strict();
+const githubStatusOutputSchema = z
+  .object({
+    ghOk: z.boolean(),
+    ghState: z
+      .enum(["ready", "needs_configuration", "unavailable"])
+      .optional(),
+    ghError: z.string().nullable(),
+    repos: z.array(
+      z
+        .object({
+          repo: z.string(),
+          projectId: z.string().nullable(),
+        })
+        .strict(),
+    ),
+    lastSyncedAt: z.string().nullable(),
+  })
+  .strict();
+const githubStartWorkOutputSchema = z
+  .object({ threadId: z.string().min(1) })
+  .strict();
+
+const roadmapItemSchema = z.object({
+  id: z.string(),
+  repo: z.string(),
+  number: z.number().int().positive(),
+  title: z.string(),
+  url: z.string(),
+  labels: z.array(z.string()),
+  priority: z.number().int().min(0),
+  updatedAt: z.string(),
+  projectId: z.string().nullable(),
+  linkedThreadId: z.string().nullable(),
 });
 
 const externalLinkSchema = z.object({
@@ -139,6 +209,7 @@ const laneSchema = z.object({
 
 export type BoardResult = {
   lanes: Array<z.infer<typeof laneSchema>>;
+  roadmapItems: Array<z.infer<typeof roadmapItemSchema>>;
   needsYouCount: number;
 };
 
@@ -147,6 +218,7 @@ export const rpcContract = defineRpcContract({
     input: z.object({ projectId: z.string().nullable().optional() }).strict(),
     output: z.object({
       lanes: z.array(laneSchema),
+      roadmapItems: z.array(roadmapItemSchema),
       needsYouCount: z.number().int().nonnegative(),
     }),
   },
@@ -160,15 +232,28 @@ export const rpcContract = defineRpcContract({
       warning: z.string().nullable(),
     }),
   },
-  getChiefOfStaff: {
+  getDriver: {
     input: z.null(),
     output: z.object({ threadId: z.string() }),
+  },
+  clearStatusOverride: {
+    input: z.object({ threadId: z.string().min(1) }).strict(),
+    output: z.object({ ok: z.literal(true) }),
   },
 });
 
 type BoardStatus = (typeof BOARD_STATUSES)[number];
 type SectionIds = Record<BoardStatus, string>;
 type ExternalLink = z.infer<typeof externalLinkSchema>;
+type GithubItem = z.infer<typeof githubItemSchema>;
+type GithubLink = z.infer<typeof githubLinkSchema>;
+
+interface MoveOptions {
+  source?: "workflow" | "user" | "driver" | "automation";
+  reason?: string;
+  setOverride?: boolean;
+  bypassWorkflowGuards?: boolean;
+}
 
 function normalizeSummary(text: string | null): string | null {
   if (!text) return null;
@@ -309,6 +394,11 @@ export default function plugin(bb: BbPluginApi) {
       label: "Context warning percent",
       default: "85",
     },
+    roadmapLimit: {
+      type: "string",
+      label: "Open roadmap item limit",
+      default: "5",
+    },
   });
 
   const childAdapter: ChildSessionAdapter = {
@@ -389,32 +479,32 @@ export default function plugin(bb: BbPluginApi) {
   };
 
   let sectionCreation: Promise<SectionIds> | null = null;
-  let chiefCreation: Promise<string> | null = null;
-  let chiefThreadIdCache: string | null = null;
+  let driverCreation: Promise<string> | null = null;
+  let driverThreadIdCache: string | null = null;
   void bb.storage.kv
-    .get<string>(CHIEF_THREAD_KEY)
+    .get<string>(DRIVER_THREAD_KEY)
     .then((threadId) => {
-      chiefThreadIdCache = threadId ?? null;
+      driverThreadIdCache = threadId ?? null;
     })
     .catch(() => undefined);
   let dispatching = false;
 
-  async function ensureChiefOfStaff(): Promise<string> {
-    if (chiefCreation) return chiefCreation;
-    chiefCreation = (async () => {
+  async function ensureDriver(): Promise<string> {
+    if (driverCreation) return driverCreation;
+    driverCreation = (async () => {
       const storedThreadId =
-        await bb.storage.kv.get<string>(CHIEF_THREAD_KEY);
+        await bb.storage.kv.get<string>(DRIVER_THREAD_KEY);
       if (storedThreadId) {
         try {
           const storedThread = await bb.sdk.threads.get({
             threadId: storedThreadId,
           });
           if (!storedThread.archivedAt && !storedThread.deletedAt) {
-            chiefThreadIdCache = storedThread.id;
+            driverThreadIdCache = storedThread.id;
             return storedThread.id;
           }
         } catch {
-          await bb.storage.kv.delete(CHIEF_THREAD_KEY);
+          await bb.storage.kv.delete(DRIVER_THREAD_KEY);
         }
       }
 
@@ -423,25 +513,25 @@ export default function plugin(bb: BbPluginApi) {
         projects.find((candidate) => candidate.kind === "personal") ??
         projects[0];
       if (!project) {
-        throw new Error("Create a bb project before opening the Chief of Staff.");
+        throw new Error("Create a bb project before opening the Driver.");
       }
 
       const thread = await bb.sdk.threads.spawn({
         projectId: project.id,
         environment: { type: "project-default" },
-        prompt: CHIEF_PROMPT,
-        title: CHIEF_TITLE,
+        prompt: DRIVER_PROMPT,
+        title: DRIVER_TITLE,
         visibility: "hidden",
       });
-      await bb.storage.kv.set(CHIEF_THREAD_KEY, thread.id);
-      chiefThreadIdCache = thread.id;
+      await bb.storage.kv.set(DRIVER_THREAD_KEY, thread.id);
+      driverThreadIdCache = thread.id;
       return thread.id;
     })();
 
     try {
-      return await chiefCreation;
+      return await driverCreation;
     } finally {
-      chiefCreation = null;
+      driverCreation = null;
     }
   }
 
@@ -475,6 +565,146 @@ export default function plugin(bb: BbPluginApi) {
     return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
   }
 
+  interface GithubSnapshot {
+    items: GithubItem[];
+    links: Record<string, GithubLink[]>;
+    projectByRepo: Map<string, string | null>;
+  }
+
+  let githubSnapshotCache:
+    | { value: GithubSnapshot; fetchedAt: number }
+    | null = null;
+  let githubSnapshotInFlight: Promise<GithubSnapshot> | null = null;
+
+  async function githubRpc<T>(
+    method: string,
+    input: Record<string, string | number | boolean | null> | null,
+    outputSchema: z.ZodType<T>,
+  ): Promise<T> {
+    return await bb.sdk.plugins.callRpc<T>({
+      pluginId: "github",
+      method,
+      ...(input === null ? {} : { input }),
+      outputSchema,
+    });
+  }
+
+  async function loadGithubSnapshot(force = false): Promise<GithubSnapshot> {
+    if (
+      !force &&
+      githubSnapshotCache &&
+      Date.now() - githubSnapshotCache.fetchedAt < 30_000
+    ) {
+      return githubSnapshotCache.value;
+    }
+    if (githubSnapshotInFlight) return githubSnapshotInFlight;
+    githubSnapshotInFlight = (async () => {
+      try {
+        const [itemResult, linkResult, statusResult] = await Promise.all([
+          githubRpc("listItems", {}, githubItemsOutputSchema),
+          githubRpc("listLinks", null, githubLinksOutputSchema),
+          githubRpc("status", null, githubStatusOutputSchema),
+        ]);
+        const value: GithubSnapshot = {
+          items: itemResult.items,
+          links: linkResult.links,
+          projectByRepo: new Map(
+            statusResult.repos.map((entry) => [entry.repo, entry.projectId]),
+          ),
+        };
+        githubSnapshotCache = { value, fetchedAt: Date.now() };
+        return value;
+      } catch (error) {
+        bb.log.debug(
+          `GitHub roadmap snapshot unavailable: ${String(error)}`,
+        );
+        const value: GithubSnapshot = {
+          items: [],
+          links: {},
+          projectByRepo: new Map(),
+        };
+        githubSnapshotCache = { value, fetchedAt: Date.now() };
+        return value;
+      } finally {
+        githubSnapshotInFlight = null;
+      }
+    })();
+    return await githubSnapshotInFlight;
+  }
+
+  function issuePriority(labels: string[]) {
+    const normalized = labels.map((label) => label.trim().toLowerCase());
+    if (
+      normalized.some((label) =>
+        ["p0", "priority:p0", "priority: critical", "critical", "urgent"].includes(
+          label,
+        ),
+      )
+    ) {
+      return 0;
+    }
+    if (
+      normalized.some((label) =>
+        ["p1", "priority:p1", "priority: high", "high"].includes(label),
+      )
+    ) {
+      return 1;
+    }
+    if (
+      normalized.some((label) =>
+        ["p2", "priority:p2", "priority: medium", "medium"].includes(label),
+      )
+    ) {
+      return 2;
+    }
+    if (
+      normalized.some((label) =>
+        ["p3", "priority:p3", "priority: low", "low"].includes(label),
+      )
+    ) {
+      return 3;
+    }
+    return 4;
+  }
+
+  function githubItemKey(item: Pick<GithubItem, "kind" | "repo" | "number">) {
+    return `${item.kind}:${item.repo}#${item.number}`;
+  }
+
+  function roadmapItems(
+    snapshot: GithubSnapshot,
+    limit: number,
+    projectId?: string | null,
+  ) {
+    return snapshot.items
+      .filter(
+        (item) =>
+          item.kind === "issue" &&
+          item.state.toLowerCase() === "open" &&
+          (!projectId || snapshot.projectByRepo.get(item.repo) === projectId),
+      )
+      .filter((item) => !(snapshot.links[githubItemKey(item)]?.length))
+      .map((item) => ({
+        id: githubItemKey(item),
+        repo: item.repo,
+        number: item.number,
+        title: item.title,
+        url: item.url,
+        labels: item.labels,
+        priority: issuePriority(item.labels),
+        updatedAt: item.updatedAt,
+        projectId: snapshot.projectByRepo.get(item.repo) ?? null,
+        linkedThreadId:
+          snapshot.links[githubItemKey(item)]?.at(-1)?.threadId ?? null,
+      }))
+      .sort(
+        (left, right) =>
+          left.priority - right.priority ||
+          Date.parse(right.updatedAt) - Date.parse(left.updatedAt),
+      )
+      .slice(0, limit);
+  }
+
   async function moveWarning(
     threadId: string,
     status: BoardStatus,
@@ -506,7 +736,7 @@ export default function plugin(bb: BbPluginApi) {
       );
     }
     if (
-      status === "DONE" &&
+      status === "CLOSED" &&
       (!state ||
         state.phase !== "egress" ||
         state.exitStatus !== "DONE" ||
@@ -515,10 +745,10 @@ export default function plugin(bb: BbPluginApi) {
         state.parkedWake !== null)
     ) {
       throw new Error(
-        "DONE requires a clean egress DONE exit with evidence and no open gate or parking condition.",
+        "CLOSED requires a clean egress DONE exit with evidence and no open gate or parking condition.",
       );
     }
-    if (status === "DONE") {
+    if (status === "CLOSED") {
       try {
         const thread = await bb.sdk.threads.get({ threadId });
         if (thread.environmentId) {
@@ -530,11 +760,11 @@ export default function plugin(bb: BbPluginApi) {
             pr.pullRequest.state !== "merged" &&
             pr.pullRequest.state !== "closed"
           ) {
-            throw new Error("DONE requires the linked pull request to be merged or closed.");
+            throw new Error("CLOSED requires the linked pull request to be merged or closed.");
           }
         }
       } catch (error) {
-        if (error instanceof Error && error.message.startsWith("DONE requires")) {
+        if (error instanceof Error && error.message.startsWith("CLOSED requires")) {
           throw error;
         }
       }
@@ -569,27 +799,57 @@ export default function plugin(bb: BbPluginApi) {
     return null;
   }
 
-  async function moveThread(threadId: string, status: BoardStatus) {
+  async function moveThread(
+    threadId: string,
+    status: BoardStatus,
+    options: MoveOptions = {},
+  ) {
+    const source = options.source ?? "workflow";
     const sections = await ensureSections();
-    const warning = await moveWarning(threadId, status, sections);
-    await bb.sdk.threads.update({ threadId, sectionId: sections[status] });
     const current = workflowStore.get(threadId);
+    if (
+      source === "workflow" &&
+      current?.statusOverride &&
+      current.statusOverride !== status
+    ) {
+      throw new Error(
+        `Manual status override ${current.statusOverride} is active; the Driver or user must clear it before workflow automation can move this card.`,
+      );
+    }
+    const warning = options.bypassWorkflowGuards
+      ? null
+      : await moveWarning(threadId, status, sections);
+    await bb.sdk.threads.update({ threadId, sectionId: sections[status] });
     const phase =
       status === "WIP"
         ? "build"
         : status === "R4R"
           ? "egress"
-          : status === "DONE"
+          : status === "CLOSED"
             ? "complete"
-            : current?.phase ?? "intake";
+            : "intake";
     workflowStore.upsert(threadId, {
       phase,
-      ...(status === "DONE" ? { completedAt: Date.now() } : {}),
+      completedAt: status === "CLOSED" ? Date.now() : null,
+      ...(options.setOverride
+        ? {
+            statusOverride: status,
+            statusOverrideReason:
+              options.reason ?? `${source} set a manual override`,
+            statusOverrideAt: Date.now(),
+          }
+        : {}),
     });
     workflowStore.appendEvent({
       threadId,
       type: "card.moved",
-      payload: { status, warning },
+      payload: {
+        status,
+        warning,
+        source,
+        reason: options.reason ?? null,
+        override: options.setOverride ?? false,
+      },
     });
     bb.realtime.publish("board-changed", { threadId, status });
     return { threadId, status, warning };
@@ -621,11 +881,11 @@ export default function plugin(bb: BbPluginApi) {
           ? "build"
           : status === "R4R"
             ? "egress"
-            : status === "DONE"
+            : status === "CLOSED"
               ? "complete"
               : "intake",
       nextAction:
-        status === "TODO"
+        status === "OPEN"
           ? "Run the plan workflow"
           : "Complete the assigned work and report a typed exit",
     });
@@ -652,6 +912,126 @@ export default function plugin(bb: BbPluginApi) {
     }
   }
 
+  let externalStatusSyncInFlight: Promise<void> | null = null;
+
+  function linkedItemsByThread(snapshot: GithubSnapshot) {
+    const itemByKey = new Map(
+      snapshot.items.map((item) => [githubItemKey(item), item]),
+    );
+    const byThread = new Map<string, GithubItem[]>();
+    for (const [key, links] of Object.entries(snapshot.links)) {
+      const item = itemByKey.get(key);
+      if (!item) continue;
+      for (const link of links) {
+        const current = byThread.get(link.threadId) ?? [];
+        current.push(item);
+        byThread.set(link.threadId, current);
+      }
+    }
+    return byThread;
+  }
+
+  async function syncExternalStatuses(projectId?: string | null) {
+    if (externalStatusSyncInFlight) return externalStatusSyncInFlight;
+    externalStatusSyncInFlight = (async () => {
+      const [snapshot, sections, threads] = await Promise.all([
+        loadGithubSnapshot(),
+        ensureSections(),
+        listThreads(projectId),
+      ]);
+      const linkedByThread = linkedItemsByThread(snapshot);
+      for (const thread of threads) {
+        const workflow = workflowStore.get(thread.id);
+        if (workflow?.statusOverride) continue;
+        const linked = linkedByThread.get(thread.id) ?? [];
+        let externalClosed = linked.some((item) =>
+          ["closed", "merged"].includes(item.state.toLowerCase()),
+        );
+        let externalOpen = linked.some((item) =>
+          ["open", "draft"].includes(item.state.toLowerCase()),
+        );
+        let pullReason: string | null = null;
+
+        if (thread.environmentId) {
+          try {
+            const pull = await bb.sdk.environments.pullRequest({
+              environmentId: thread.environmentId,
+            });
+            if (pull.outcome === "available") {
+              externalClosed ||= ["merged", "closed"].includes(
+                pull.pullRequest.state,
+              );
+              externalOpen ||= ["open", "draft"].includes(
+                pull.pullRequest.state,
+              );
+              if (["merged", "closed"].includes(pull.pullRequest.state)) {
+                pullReason =
+                  "Pull request #" + pull.pullRequest.number + " is " + pull.pullRequest.state;
+              }
+            }
+          } catch {
+            // Cached GitHub issue/link state remains usable.
+          }
+        }
+
+        const reason = externalClosed
+          ? pullReason ?? "Linked GitHub issue or pull request closed"
+          : "Linked GitHub issue or pull request reopened";
+
+        const currentStatus =
+          (Object.entries(sections).find(
+            ([, sectionId]) => sectionId === thread.sectionId,
+          )?.[0] as BoardStatus | undefined) ?? "OPEN";
+        let destination: BoardStatus | null = null;
+        if (externalClosed && currentStatus !== "CLOSED") {
+          destination = "CLOSED";
+        } else if (
+          !externalClosed &&
+          externalOpen &&
+          currentStatus === "CLOSED"
+        ) {
+          destination = workflowStore
+            .listEvents(thread.id)
+            .some((event) => event.type === "verification.completed")
+            ? "R4R"
+            : "OPEN";
+        }
+        if (!destination) continue;
+
+        await moveThread(thread.id, destination, {
+          source: "automation",
+          reason,
+          bypassWorkflowGuards: true,
+        });
+        workflowStore.upsert(thread.id, {
+          phase:
+            destination === "CLOSED"
+              ? "complete"
+              : destination === "R4R"
+                ? "egress"
+                : "intake",
+          nextAction:
+            destination === "CLOSED"
+              ? "No action"
+              : destination === "R4R"
+                ? "Review the reopened pull request"
+                : "Review roadmap priority and plan the reopened work",
+        });
+        workflowStore.appendEvent({
+          threadId: thread.id,
+          type: "status.external-sync",
+          payload: {
+            destination,
+            reason,
+          },
+        });
+      }
+    })().finally(() => {
+      externalStatusSyncInFlight = null;
+    });
+    return await externalStatusSyncInFlight;
+  }
+
   function nativeGate(
     attention: string | null | undefined,
   ): CardWorkflowState["gate"] {
@@ -663,18 +1043,22 @@ export default function plugin(bb: BbPluginApi) {
   }
 
   async function listBoard(projectId?: string | null) {
-    const [sections, projects, threads, configured] = await Promise.all([
-      ensureSections(),
-      bb.sdk.projects.list({ includePersonal: true }),
-      listThreads(projectId),
-      settings.get(),
-    ]);
+    await syncExternalStatuses(projectId);
+    const [sections, projects, threads, configured, githubSnapshot] =
+      await Promise.all([
+        ensureSections(),
+        bb.sdk.projects.list({ includePersonal: true }),
+        listThreads(projectId),
+        settings.get(),
+        loadGithubSnapshot(),
+      ]);
     const projectNames = new Map(
       projects.map((project) => [project.id, project.name]),
     );
     const sectionStatuses = new Map(
       BOARD_STATUSES.map((status) => [sections[status], status]),
     );
+    const githubItemsByThread = linkedItemsByThread(githubSnapshot);
     const staleMs =
       positiveInteger(configured.staleHours, 24) * 60 * 60 * 1_000;
     const contextWarning =
@@ -702,6 +1086,14 @@ export default function plugin(bb: BbPluginApi) {
       const assistantText =
         output?.output ?? (timeline ? latestAssistantText(timeline.rows) : null);
       let links = extractExternalLinks(assistantText);
+      for (const item of githubItemsByThread.get(thread.id) ?? []) {
+        links = addLink(links, {
+          kind: item.kind === "pr" ? "pull-request" : "issue",
+          label: `${item.kind === "pr" ? "PR" : "Issue"} #${item.number}`,
+          url: item.url,
+          state: item.state.toLowerCase(),
+        });
+      }
       if (pullRequest?.outcome === "available") {
         links = addLink(links, {
           kind: "pull-request",
@@ -719,15 +1111,15 @@ export default function plugin(bb: BbPluginApi) {
               ? "build"
               : thread.sectionId === sections.R4R
                 ? "egress"
-                : thread.sectionId === sections.DONE
+                : thread.sectionId === sections.CLOSED
                   ? "complete"
                   : "intake",
           nextAction:
-            thread.sectionId === sections.TODO ? "Define and approve the plan" : null,
+            thread.sectionId === sections.OPEN ? "Define and approve the plan" : null,
         });
       if (!workflow.nextAction) {
         const nextAction =
-          thread.sectionId === sections.TODO
+          thread.sectionId === sections.OPEN
             ? "Run the plan workflow"
             : thread.sectionId === sections.WIP
               ? "Complete the current pass and report a typed exit"
@@ -754,7 +1146,7 @@ export default function plugin(bb: BbPluginApi) {
       if (derivedGate !== "none") attention.add(derivedGate);
       if (thread.hasPendingInteraction) attention.add("needs-input");
       if (thread.status === "error") attention.add("runtime-error");
-      if (Date.now() - thread.updatedAt > staleMs && thread.sectionId !== sections.DONE) {
+      if (Date.now() - thread.updatedAt > staleMs && thread.sectionId !== sections.CLOSED) {
         attention.add("stale");
       }
       if (
@@ -773,7 +1165,7 @@ export default function plugin(bb: BbPluginApi) {
         attention.add("context-high");
       }
       if (
-        thread.sectionId === sections.DONE &&
+        thread.sectionId === sections.CLOSED &&
         pullRequest?.outcome === "available" &&
         pullRequest.pullRequest.state !== "merged" &&
         pullRequest.pullRequest.state !== "closed"
@@ -786,7 +1178,7 @@ export default function plugin(bb: BbPluginApi) {
         title: thread.title ?? thread.titleFallback ?? "Untitled thread",
         projectId: thread.projectId,
         projectName: projectNames.get(thread.projectId) ?? "Unknown project",
-        status: sectionStatuses.get(thread.sectionId ?? "") ?? "TODO",
+        status: sectionStatuses.get(thread.sectionId ?? "") ?? "OPEN",
         runtimeStatus: thread.status,
         harness: thread.providerId,
         model: execution?.model ?? null,
@@ -809,6 +1201,9 @@ export default function plugin(bb: BbPluginApi) {
           blockedBy: workflow.blockedBy,
           parkedWake: workflow.parkedWake,
           phaseStartedAt: workflow.phaseStartedAt,
+          statusOverride: workflow.statusOverride,
+          statusOverrideReason: workflow.statusOverrideReason,
+          statusOverrideAt: workflow.statusOverrideAt,
         },
         attention: [...attention],
         updatedAt: thread.updatedAt,
@@ -817,10 +1212,10 @@ export default function plugin(bb: BbPluginApi) {
 
     cards.sort((a, b) => b.updatedAt - a.updatedAt);
     const limits: Record<BoardStatus, number | null> = {
-      TODO: null,
+      OPEN: null,
       WIP: positiveInteger(configured.wipLimit, 3),
       R4R: positiveInteger(configured.reviewLimit, 6),
-      DONE: null,
+      CLOSED: null,
     };
     const lanes = BOARD_STATUSES.map((status) => {
       const laneCards = cards.filter((card) => card.status === status);
@@ -846,6 +1241,11 @@ export default function plugin(bb: BbPluginApi) {
     });
     return {
       lanes,
+      roadmapItems: roadmapItems(
+        githubSnapshot,
+        positiveInteger(configured.roadmapLimit, 5),
+        projectId,
+      ),
       needsYouCount: lanes
         .flatMap((lane) => lane.cards)
         .filter((card) => card.attention.length > 0).length,
@@ -900,9 +1300,9 @@ export default function plugin(bb: BbPluginApi) {
     }
   }
 
-  async function notifyChief(text: string) {
-    if (!chiefThreadIdCache) return;
-    await notifyController(chiefThreadIdCache, text);
+  async function notifyDriver(text: string) {
+    if (!driverThreadIdCache) return;
+    await notifyController(driverThreadIdCache, text);
   }
 
   function planForStore(
@@ -1303,13 +1703,13 @@ export default function plugin(bb: BbPluginApi) {
       workflowStore.wake({
         threadId: state.threadId,
         reason: `${wake.kind} wake condition satisfied`,
-        nextAction: "Ready for Chief dispatch",
+        nextAction: "Ready for Driver dispatch",
       });
       woken.push(state.threadId);
     }
     if (woken.length) {
       bb.realtime.publish("board-changed", { event: "cards.woken", woken });
-      await notifyChief(
+      await notifyDriver(
         `Autobahn wake pass surfaced ${woken.length} card(s): ${woken.join(", ")}. Inventory the board and recommend the single next dispatch action.`,
       );
     }
@@ -1337,7 +1737,7 @@ export default function plugin(bb: BbPluginApi) {
           findings.push(`${card.id}: high context without a next action`);
         }
         if (card.attention.includes("done-with-open-pr")) {
-          findings.push(`${card.id}: DONE while its PR remains open`);
+          findings.push(`${card.id}: CLOSED while its PR remains open`);
         }
         if (card.attention.includes("checks-failed")) {
           findings.push(`${card.id}: pull request checks failed`);
@@ -1346,12 +1746,12 @@ export default function plugin(bb: BbPluginApi) {
           findings.push(`${card.id}: review changes requested`);
         }
         if (
-          card.status !== "DONE" &&
+          card.status !== "CLOSED" &&
           card.links.some(
             (link) => link.kind === "pull-request" && link.state === "merged",
           )
         ) {
-          findings.push(`${card.id}: pull request merged but card is not DONE`);
+          findings.push(`${card.id}: pull request merged but card is not CLOSED`);
         }
         if (
           card.runtimeStatus === "active" &&
@@ -1373,20 +1773,49 @@ export default function plugin(bb: BbPluginApi) {
     );
   }
 
+  async function clearStatusOverride(threadId: string, reason: string) {
+    workflowStore.upsert(threadId, {
+      statusOverride: null,
+      statusOverrideReason: null,
+      statusOverrideAt: null,
+    });
+    workflowStore.appendEvent({
+      threadId,
+      type: "status.override-cleared",
+      payload: { reason },
+    });
+    githubSnapshotCache = null;
+    await syncExternalStatuses();
+    bb.realtime.publish("board-changed", {
+      threadId,
+      event: "status.override-cleared",
+    });
+  }
+
   bb.rpc.register(rpcContract, {
     listBoard: ({ projectId }) => listBoard(projectId),
-    moveThread: ({ threadId, status }) => moveThread(threadId, status),
-    getChiefOfStaff: async () => ({
-      threadId: await ensureChiefOfStaff(),
+    moveThread: ({ threadId, status }) =>
+      moveThread(threadId, status, {
+        source: "user",
+        reason: "User moved the card",
+        setOverride: true,
+        bypassWorkflowGuards: true,
+      }),
+    getDriver: async () => ({
+      threadId: await ensureDriver(),
     }),
+    clearStatusOverride: async ({ threadId }) => {
+      await clearStatusOverride(threadId, "User restored automatic status");
+      return { ok: true as const };
+    },
   });
 
   bb.agents.registerTool({
     name: "autobahn_move_thread",
     description:
-      "Move the current bb thread's Autobahn card to TODO, WIP, R4R, or DONE.",
+      "Move the current bb thread's Autobahn card to OPEN, WIP, R4R, or CLOSED.",
     instructions:
-      "Keep the current thread's board status accurate. Use WIP after substantive work begins, R4R when the result is ready for review, and DONE only when the requested outcome is complete.",
+      "Keep the current thread's board status accurate. OPEN is the roadmap, WIP is active execution, R4R is verified review, and CLOSED follows external completion unless manually overridden.",
     experimental_statusLabels: {
       pending: "Moving Autobahn card",
       completed: "Moved Autobahn card",
@@ -1441,9 +1870,9 @@ export default function plugin(bb: BbPluginApi) {
         projectId,
         title,
         prompt,
-        status: "TODO",
+        status: "OPEN",
       });
-      return `Created "${title}" as TODO thread ${thread.id}; run planning before dispatch.`;
+      return `Created "${title}" as OPEN thread ${thread.id}; run planning before dispatch.`;
     },
   });
 
@@ -1492,20 +1921,105 @@ export default function plugin(bb: BbPluginApi) {
 
   bb.agents.registerTool({
     name: "autobahn_move_card",
-    description: "Move any thread card to TODO, WIP, R4R, or DONE.",
+    description:
+      "Set a Driver status override on any card. Automation pauses until the override is cleared.",
     experimental_statusLabels: {
-      pending: "Moving Autobahn card",
-      completed: "Moved Autobahn card",
+      pending: "Overriding Autobahn status",
+      completed: "Overrode Autobahn status",
     },
     parameters: z
       .object({
         threadId: z.string().min(1),
         status: boardStatusSchema,
+        reason: z.string().min(1),
       })
       .strict(),
-    execute: async ({ threadId, status }) => {
-      await moveThread(threadId, status);
-      return `Moved thread ${threadId} to ${status}.`;
+    execute: async ({ threadId, status, reason }) => {
+      await moveThread(threadId, status, {
+        source: "driver",
+        reason,
+        setOverride: true,
+        bypassWorkflowGuards: true,
+      });
+      return `Overrode thread ${threadId} to ${status}: ${reason}`;
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "autobahn_clear_status_override",
+    description:
+      "Clear a manual card status override and immediately resume issue/PR automation.",
+    experimental_statusLabels: {
+      pending: "Restoring automatic status",
+      completed: "Restored automatic status",
+    },
+    parameters: z
+      .object({
+        threadId: z.string().min(1),
+        reason: z.string().min(1),
+      })
+      .strict(),
+    execute: async ({ threadId, reason }) => {
+      await clearStatusOverride(threadId, reason);
+      return `Automatic external status restored for ${threadId}.`;
+    },
+  });
+
+  bb.agents.registerTool({
+    name: "autobahn_start_roadmap_item",
+    description:
+      "Create a stopped OPEN controller thread from a tracked GitHub issue.",
+    experimental_statusLabels: {
+      pending: "Starting roadmap item",
+      completed: "Started roadmap item",
+    },
+    parameters: z
+      .object({
+        repo: z.string().regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/),
+        number: z.number().int().positive(),
+      })
+      .strict(),
+    execute: async ({ repo, number }) => {
+      const snapshot = await loadGithubSnapshot(true);
+      const issue = snapshot.items.find(
+        (item) =>
+          item.kind === "issue" &&
+          item.repo === repo &&
+          item.number === number,
+      );
+      if (!issue) {
+        throw new Error(`GitHub issue ${repo}#${number} is not cached.`);
+      }
+      if (issue.state.toLowerCase() !== "open") {
+        throw new Error(`GitHub issue ${repo}#${number} is not open.`);
+      }
+      const started = await githubRpc(
+        "startWork",
+        { repo, number },
+        githubStartWorkOutputSchema,
+      );
+      await bb.sdk.threads.stop({ threadId: started.threadId });
+      await moveThread(started.threadId, "OPEN", {
+        source: "automation",
+        reason: `Roadmap issue ${repo}#${number} added`,
+        bypassWorkflowGuards: true,
+      });
+      workflowStore.upsert(started.threadId, {
+        phase: "intake",
+        priority: issuePriority(issue.labels),
+        nextAction: "Run the plan workflow",
+      });
+      workflowStore.appendEvent({
+        threadId: started.threadId,
+        type: "roadmap.started",
+        payload: {
+          repo,
+          number,
+          url: issue.url,
+        },
+      });
+      githubSnapshotCache = null;
+      return `Created OPEN controller ${started.threadId} for ${repo}#${number}.`;
     },
   });
 
@@ -1542,7 +2056,7 @@ export default function plugin(bb: BbPluginApi) {
     description:
       "Report a typed station exit with evidence and the single next action.",
     instructions:
-      "Call this at the end of every plan, build, verify, or egress pass. A successful build does not mean DONE; it advances to verification.",
+      "Call this at the end of every plan, build, verify, or egress pass. A successful build does not close the card; it advances to verification.",
     experimental_statusLabels: {
       pending: "Recording station exit",
       completed: "Recorded station exit",
@@ -1601,7 +2115,7 @@ export default function plugin(bb: BbPluginApi) {
           !verified
         ) {
           throw new Error(
-            "Egress DONE requires a verified card currently in R4R.",
+            "Closing requires a verified card currently in R4R.",
           );
         }
       }
@@ -1630,7 +2144,7 @@ export default function plugin(bb: BbPluginApi) {
           nextAction: "Run the fresh-context verification panel",
         });
       } else if (phase === "egress" && status === "DONE") {
-        await moveThread(threadId, "DONE");
+        await moveThread(threadId, "CLOSED");
       }
       bb.realtime.publish("board-changed", {
         threadId,
@@ -1733,7 +2247,7 @@ export default function plugin(bb: BbPluginApi) {
       .strict(),
     execute: async (
       { threadId, recommendation },
-      { threadId: chiefThreadId, signal },
+      { threadId: driverThreadId, signal },
     ) => {
       const state = workflowStore.get(threadId);
       if (!state?.planContract) {
@@ -1741,7 +2255,7 @@ export default function plugin(bb: BbPluginApi) {
       }
       const interaction = await bb.ui.requestInput(
         {
-          threadId: chiefThreadId,
+          threadId: driverThreadId,
           rendererId: "plan-approval",
           title: "Autobahn plan approval",
           payload: {
@@ -1829,7 +2343,7 @@ export default function plugin(bb: BbPluginApi) {
   bb.agents.registerTool({
     name: "autobahn_dispatch_ready",
     description:
-      "Deterministically fill available WIP slots with planned, approved, unblocked, unparked TODO cards.",
+      "Deterministically fill available WIP slots with planned, approved, unblocked, unparked OPEN cards.",
     experimental_statusLabels: {
       pending: "Dispatching ready cards",
       completed: "Dispatched ready cards",
@@ -1848,7 +2362,7 @@ export default function plugin(bb: BbPluginApi) {
       try {
       const board = await listBoard(projectId);
       const wip = board.lanes.find((lane) => lane.status === "WIP")!;
-      const todo = board.lanes.find((lane) => lane.status === "TODO")!;
+      const todo = board.lanes.find((lane) => lane.status === "OPEN")!;
       const slots = Math.max(
         0,
         Math.min(
@@ -1886,7 +2400,7 @@ export default function plugin(bb: BbPluginApi) {
                   card.workflow.nextAction
                     ? `Current next action: ${card.workflow.nextAction}`
                     : "",
-                  "Finish this pass with autobahn_report_exit. A successful build advances to verification, not directly to DONE.",
+                  "Finish this pass with autobahn_report_exit. A successful build advances to verification, not directly to CLOSED.",
                 ]
                   .filter(Boolean)
                   .join("\n"),
@@ -1902,7 +2416,7 @@ export default function plugin(bb: BbPluginApi) {
           });
         } catch (error) {
           await bb.sdk.threads.stop({ threadId: card.id }).catch(() => undefined);
-          await moveThread(card.id, "TODO").catch(() => undefined);
+          await moveThread(card.id, "OPEN").catch(() => undefined);
           workflowStore.upsert(card.id, {
             phase: "plan",
             gate: "blocked",
@@ -1992,7 +2506,7 @@ export default function plugin(bb: BbPluginApi) {
       .object({
         threadId: z.string().min(1),
         reason: z.string().min(1),
-        nextAction: z.string().min(1).default("Ready for Chief dispatch"),
+        nextAction: z.string().min(1).default("Ready for Driver dispatch"),
       })
       .strict(),
     execute: async ({ threadId, reason, nextAction }) => {
@@ -2021,11 +2535,13 @@ export default function plugin(bb: BbPluginApi) {
     },
   });
 
-  const chiefTools = [
+  const driverTools = [
     "autobahn_list_cards",
     "autobahn_create_session",
     "autobahn_assign_session",
     "autobahn_move_card",
+    "autobahn_clear_status_override",
+    "autobahn_start_roadmap_item",
     "autobahn_control_session",
     "autobahn_set_contract",
     "autobahn_run_plan",
@@ -2054,21 +2570,21 @@ export default function plugin(bb: BbPluginApi) {
           "This is a read-only fresh-context station. Inspect and return only the requested structured result. Do not edit files or mutate Autobahn state.",
       };
     }
-    const isChief =
-      context.thread.id === chiefThreadIdCache &&
+    const isDriver =
+      context.thread.id === driverThreadIdCache &&
       context.origin.pluginId === bb.pluginId;
-    return isChief
+    return isDriver
       ? {
-          tools: chiefTools,
-          skills: ["autobahn-chief"],
+          tools: driverTools,
+          skills: ["autobahn-driver"],
           instructions:
-            "You are the policy-driven Autobahn Chief of Staff. Inventory before acting; use fresh child sessions for planning and verification; enforce gates, dependencies, parking, and soft WIP; require typed exits and one Next action; never bypass human approval or auto-kill work.",
+            "You are the policy-driven Autobahn Driver. Inventory before acting; use fresh child sessions for planning and verification; enforce gates, dependencies, parking, and soft WIP; require typed exits and one Next action; never bypass human approval or auto-kill work.",
         }
       : {
           tools: ["autobahn_move_thread", "autobahn_report_exit"],
           skills: [],
           instructions:
-            "Keep this controller card current and end every station pass with autobahn_report_exit, evidence, and one Next action. Build success advances to verification; only verified work reaches R4R; DONE requires a clean final exit.",
+            "Keep this controller card current and end every station pass with autobahn_report_exit, evidence, and one Next action. Build success advances to verification; only verified work reaches R4R; CLOSED requires a clean final exit.",
         };
   });
 
@@ -2086,12 +2602,12 @@ export default function plugin(bb: BbPluginApi) {
   }
 
   bb.events.on("thread.idle", async ({ thread }) => {
-    const chiefThreadId =
-      await bb.storage.kv.get<string>(CHIEF_THREAD_KEY);
-    if (thread.id === chiefThreadId) {
+    const driverThreadId =
+      await bb.storage.kv.get<string>(DRIVER_THREAD_KEY);
+    if (thread.id === driverThreadId) {
       await bb.sdk.threads.stop({ threadId: thread.id }).catch((error) => {
         bb.log.warn(
-          `Could not release Chief of Staff thread ${thread.id}: ${String(error)}`,
+          `Could not release Driver thread ${thread.id}: ${String(error)}`,
         );
       });
     }
@@ -2099,17 +2615,22 @@ export default function plugin(bb: BbPluginApi) {
 
   for (const event of ["thread.archived", "thread.deleted"] as const) {
     bb.events.on(event, async ({ thread }) => {
-      const chiefThreadId =
-        await bb.storage.kv.get<string>(CHIEF_THREAD_KEY);
-      if (thread.id === chiefThreadId) {
-        await bb.storage.kv.delete(CHIEF_THREAD_KEY);
-        chiefThreadIdCache = null;
+      const driverThreadId =
+        await bb.storage.kv.get<string>(DRIVER_THREAD_KEY);
+      if (thread.id === driverThreadId) {
+        await bb.storage.kv.delete(DRIVER_THREAD_KEY);
+        driverThreadIdCache = null;
       }
     });
   }
 
   bb.background.schedule("wake-cards", "* * * * *", async () => {
     await wakeReadyCards();
+  });
+
+  bb.background.schedule("external-status-sync", "*/5 * * * *", async () => {
+    githubSnapshotCache = null;
+    await syncExternalStatuses();
   });
 
   bb.background.schedule("witness-scan", "*/15 * * * *", async () => {
@@ -2121,7 +2642,7 @@ export default function plugin(bb: BbPluginApi) {
     await bb.storage.kv.set(WITNESS_FINGERPRINT_KEY, fingerprint);
     if (findings.length) {
       bb.log.warn(`Autobahn witness: ${findings.join(" | ")}`);
-      await notifyChief(
+      await notifyDriver(
         `Autobahn witness found:\n${findings.join("\n")}\nRecommend action; do not stop work automatically.`,
       );
     }

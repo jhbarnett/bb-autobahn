@@ -33,6 +33,9 @@ export const WORKFLOW_STATE_MIGRATIONS = [
   )`,
   `CREATE INDEX IF NOT EXISTS card_workflow_events_thread_created_idx
     ON card_workflow_events (thread_id, created_at, id)`,
+  `ALTER TABLE card_workflow_state ADD COLUMN status_override TEXT`,
+  `ALTER TABLE card_workflow_state ADD COLUMN status_override_reason TEXT`,
+  `ALTER TABLE card_workflow_state ADD COLUMN status_override_at INTEGER`,
 ] as const;
 
 export const WORKFLOW_PHASES = [
@@ -67,6 +70,8 @@ export type WorkflowPhase = (typeof WORKFLOW_PHASES)[number];
 export type WorkflowGate = (typeof WORKFLOW_GATES)[number];
 export type RiskClass = (typeof RISK_CLASSES)[number];
 export type ExitStatus = (typeof EXIT_STATUSES)[number];
+export const STATUS_OVERRIDES = ["OPEN", "WIP", "R4R", "CLOSED"] as const;
+export type StatusOverride = (typeof STATUS_OVERRIDES)[number];
 
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue =
@@ -110,6 +115,9 @@ export interface CardWorkflowState {
   planContract: PlanContract | null;
   blockedBy: string[];
   parkedWake: ParkedWake | null;
+  statusOverride: StatusOverride | null;
+  statusOverrideReason: string | null;
+  statusOverrideAt: number | null;
   createdAt: number;
   updatedAt: number;
   phaseStartedAt: number;
@@ -190,6 +198,9 @@ interface WorkflowStateRow {
   plan_contract_json: string | null;
   blocked_by_json: string;
   parked_wake_json: string | null;
+  status_override: string | null;
+  status_override_reason: string | null;
+  status_override_at: number | null;
   created_at: number;
   updated_at: number;
   phase_started_at: number;
@@ -380,6 +391,9 @@ function stateToJson(state: CardWorkflowState): JsonObject {
     blockedBy: state.blockedBy,
     parkedWake:
       state.parkedWake === null ? null : parkedWakeToJson(state.parkedWake),
+    statusOverride: state.statusOverride,
+    statusOverrideReason: state.statusOverrideReason,
+    statusOverrideAt: state.statusOverrideAt,
     createdAt: state.createdAt,
     updatedAt: state.updatedAt,
     phaseStartedAt: state.phaseStartedAt,
@@ -403,12 +417,14 @@ export function createWorkflowStateStore(
     `INSERT INTO card_workflow_state (
       thread_id, phase, gate, risk_class, priority, attempt, exit_status,
       next_action, concerns_json, evidence_json, plan_contract_json,
-      blocked_by_json, parked_wake_json, created_at, updated_at,
+      blocked_by_json, parked_wake_json, status_override,
+      status_override_reason, status_override_at, created_at, updated_at,
       phase_started_at, completed_at
     ) VALUES (
       @thread_id, @phase, @gate, @risk_class, @priority, @attempt, @exit_status,
       @next_action, @concerns_json, @evidence_json, @plan_contract_json,
-      @blocked_by_json, @parked_wake_json, @created_at, @updated_at,
+      @blocked_by_json, @parked_wake_json, @status_override,
+      @status_override_reason, @status_override_at, @created_at, @updated_at,
       @phase_started_at, @completed_at
     ) ON CONFLICT(thread_id) DO UPDATE SET
       phase = excluded.phase,
@@ -423,6 +439,9 @@ export function createWorkflowStateStore(
       plan_contract_json = excluded.plan_contract_json,
       blocked_by_json = excluded.blocked_by_json,
       parked_wake_json = excluded.parked_wake_json,
+      status_override = excluded.status_override,
+      status_override_reason = excluded.status_override_reason,
+      status_override_at = excluded.status_override_at,
       updated_at = excluded.updated_at,
       phase_started_at = excluded.phase_started_at,
       completed_at = excluded.completed_at`,
@@ -467,6 +486,12 @@ export function createWorkflowStateStore(
       planContract: parsePlanContract(row.plan_contract_json),
       blockedBy: parseStringArray(row.blocked_by_json),
       parkedWake: parseParkedWake(row.parked_wake_json),
+      statusOverride:
+        row.status_override === null
+          ? null
+          : oneOf(row.status_override, STATUS_OVERRIDES, "OPEN"),
+      statusOverrideReason: row.status_override_reason,
+      statusOverrideAt: row.status_override_at,
       createdAt: row.created_at,
       updatedAt: row.updated_at,
       phaseStartedAt: row.phase_started_at,
@@ -495,6 +520,9 @@ export function createWorkflowStateStore(
         state.parkedWake === null
           ? null
           : encodeJson(parkedWakeToJson(state.parkedWake)),
+      status_override: state.statusOverride,
+      status_override_reason: state.statusOverrideReason,
+      status_override_at: state.statusOverrideAt,
       created_at: state.createdAt,
       updated_at: state.updatedAt,
       phase_started_at: state.phaseStartedAt,
@@ -527,6 +555,9 @@ export function createWorkflowStateStore(
       planContract: null,
       blockedBy: [],
       parkedWake: null,
+      statusOverride: null,
+      statusOverrideReason: null,
+      statusOverrideAt: null,
       createdAt: timestamp,
       updatedAt: timestamp,
       phaseStartedAt: timestamp,

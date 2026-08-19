@@ -7,7 +7,7 @@ import plugin from "./server";
 
 describe("autobahn backend", () => {
   it("builds cards from bb data and lets an agent move its current thread", async () => {
-    const sections = ["TODO", "WIP", "R4R", "DONE"].map((name) => ({
+    const sections = ["OPEN", "WIP", "R4R", "CLOSED"].map((name) => ({
       id: `section-${name}`,
       name,
       createdAt: 1,
@@ -16,7 +16,7 @@ describe("autobahn backend", () => {
     const update = vi.fn(() => ({ id: "thread-1" }));
     const { bb, harness } = createFakePluginHost({
       pluginId: "autobahn",
-      agentSkillIds: ["autobahn-chief"],
+      agentSkillIds: ["autobahn-driver"],
       sdk: {
         threadSections: {
           list: () => sections,
@@ -106,10 +106,10 @@ describe("autobahn backend", () => {
     };
 
     expect(board.lanes.map((lane) => lane.status)).toEqual([
-      "TODO",
+      "OPEN",
       "WIP",
       "R4R",
-      "DONE",
+      "CLOSED",
     ]);
     expect(board.lanes[1].cards[0]).toMatchObject({
       title: "Ship feature",
@@ -124,13 +124,13 @@ describe("autobahn backend", () => {
     await expect(
       harness.behavior.callAgentTool(
         "autobahn_move_thread",
-        { status: "TODO" },
+        { status: "OPEN" },
         { threadId: "thread-1" },
       ),
-    ).resolves.toBe("Moved this thread to TODO.");
+    ).resolves.toBe("Moved this thread to OPEN.");
     expect(update).toHaveBeenCalledWith({
       threadId: "thread-1",
-      sectionId: "section-TODO",
+      sectionId: "section-OPEN",
     });
     await expect(
       harness.behavior.callAgentTool(
@@ -141,8 +141,8 @@ describe("autobahn backend", () => {
     ).rejects.toThrow("completed fresh-context verification panel");
   });
 
-  it("persists a hidden Chief of Staff with scoped session-management tools", async () => {
-    const sections = ["TODO", "WIP", "R4R", "DONE"].map((name) => ({
+  it("persists a hidden Driver with scoped session-management tools", async () => {
+    const sections = ["OPEN", "WIP", "R4R", "CLOSED"].map((name) => ({
       id: `section-${name}`,
       name,
       createdAt: 1,
@@ -150,8 +150,8 @@ describe("autobahn backend", () => {
     }));
     const spawn = vi.fn(({ title, visibility }) => ({
       id:
-        title === "Autobahn Chief of Staff" && visibility === "hidden"
-          ? "chief-thread"
+        title === "Autobahn Driver" && visibility === "hidden"
+          ? "driver-thread"
           : "worker-thread",
     }));
     const send = vi.fn(() => ({ ok: true }));
@@ -161,7 +161,7 @@ describe("autobahn backend", () => {
     const unarchive = vi.fn(() => ({ ok: true }));
     const { bb, harness } = createFakePluginHost({
       pluginId: "autobahn",
-      agentSkillIds: ["autobahn-chief"],
+      agentSkillIds: ["autobahn-driver"],
       sdk: {
         threadSections: {
           list: () => sections,
@@ -200,7 +200,7 @@ describe("autobahn backend", () => {
             id: "worker-thread",
             projectId: "project-1",
             environmentId: "environment-1",
-            sectionId: "section-TODO",
+            sectionId: "section-OPEN",
             archivedAt: null,
             deletedAt: null,
           }),
@@ -215,20 +215,20 @@ describe("autobahn backend", () => {
     plugin(bb);
 
     await expect(
-      harness.behavior.callRpc("getChiefOfStaff"),
-    ).resolves.toEqual({ threadId: "chief-thread" });
+      harness.behavior.callRpc("getDriver"),
+    ).resolves.toEqual({ threadId: "driver-thread" });
     expect(spawn).toHaveBeenCalledWith(
       expect.objectContaining({
         projectId: "personal-project",
-        title: "Autobahn Chief of Staff",
+        title: "Autobahn Driver",
         visibility: "hidden",
       }),
     );
 
-    const chiefConfig = await harness.behavior.resolveAgentConfiguration({
+    const driverConfig = await harness.behavior.resolveAgentConfiguration({
       thread: {
-        id: "chief-thread",
-        title: "Autobahn Chief of Staff",
+        id: "driver-thread",
+        title: "Autobahn Driver",
         parentThreadId: null,
         sourceThreadId: null,
       },
@@ -249,11 +249,13 @@ describe("autobahn backend", () => {
       provider: { id: "codex", model: "gpt-5.6" },
       origin: { kind: null, pluginId: "autobahn" },
     });
-    expect(chiefConfig.tools.map((tool) => tool.name)).toEqual([
+    expect(driverConfig.tools.map((tool) => tool.name)).toEqual([
       "autobahn_list_cards",
       "autobahn_create_session",
       "autobahn_assign_session",
       "autobahn_move_card",
+      "autobahn_clear_status_override",
+      "autobahn_start_roadmap_item",
       "autobahn_control_session",
       "autobahn_set_contract",
       "autobahn_run_plan",
@@ -302,7 +304,7 @@ describe("autobahn backend", () => {
     expect(spawn).toHaveBeenCalledWith(
       expect.objectContaining({
         projectId: "project-1",
-        sectionId: "section-TODO",
+        sectionId: "section-OPEN",
         title: "Implement compact cards",
         visibility: "visible",
       }),
@@ -315,18 +317,19 @@ describe("autobahn backend", () => {
           threadId: "worker-thread",
           prompt: "Also add harness logos.",
         },
-        { threadId: "chief-thread" },
+        { threadId: "driver-thread" },
       ),
     ).rejects.toThrow("planned, approved, unparked WIP");
     expect(send).not.toHaveBeenCalled();
 
     await harness.behavior.callAgentTool("autobahn_move_card", {
       threadId: "worker-thread",
-      status: "TODO",
+      status: "OPEN",
+      reason: "Keep this task open",
     });
     expect(update).toHaveBeenCalledWith({
       threadId: "worker-thread",
-      sectionId: "section-TODO",
+      sectionId: "section-OPEN",
     });
 
     await harness.behavior.callAgentTool("autobahn_control_session", {
@@ -337,14 +340,14 @@ describe("autobahn backend", () => {
     expect(archive).toHaveBeenCalledWith({ threadId: "worker-thread" });
 
     await harness.behavior.emitThreadEvent("thread.idle", {
-      thread: makeThreadResponse({ id: "chief-thread" }),
+      thread: makeThreadResponse({ id: "driver-thread" }),
       lastAssistantText: "Ready.",
     });
-    expect(stop).toHaveBeenCalledWith({ threadId: "chief-thread" });
+    expect(stop).toHaveBeenCalledWith({ threadId: "driver-thread" });
   });
 
   it("enforces contracts, dispatches within WIP, records exits, and wakes parked cards", async () => {
-    const sections = ["TODO", "WIP", "R4R", "DONE"].map((name) => ({
+    const sections = ["OPEN", "WIP", "R4R", "CLOSED"].map((name) => ({
       id: `section-${name}`,
       name,
       createdAt: 1,
@@ -357,7 +360,7 @@ describe("autobahn backend", () => {
       providerId: "codex",
       title: "Policy-driven card",
       titleFallback: null,
-      sectionId: "section-TODO",
+      sectionId: "section-OPEN",
       status: "idle",
       hasPendingInteraction: false,
       environmentBranchName: "feature/policy",
@@ -371,7 +374,7 @@ describe("autobahn backend", () => {
     const stop = vi.fn(() => ({ ok: true }));
     const { bb, harness } = createFakePluginHost({
       pluginId: "autobahn",
-      agentSkillIds: ["autobahn-chief"],
+      agentSkillIds: ["autobahn-driver"],
       sdk: {
         threadSections: {
           list: () => sections,
@@ -448,7 +451,7 @@ describe("autobahn backend", () => {
         threadId: "thread-1",
         recommendation: "Approve the reviewed contract",
       },
-      { threadId: "chief-thread" },
+      { threadId: "driver-thread" },
     );
     await vi.waitFor(() => {
       expect(harness.inspection.pendingInteractions).toHaveLength(1);
@@ -463,14 +466,14 @@ describe("autobahn backend", () => {
       harness.behavior.callAgentTool(
         "autobahn_dispatch_ready",
         { projectId: "project-1" },
-        { threadId: "chief-thread" },
+        { threadId: "driver-thread" },
       ),
     ).resolves.toContain("Dispatched 1");
     expect(row.sectionId).toBe("section-WIP");
     expect(send).toHaveBeenCalledWith(
       expect.objectContaining({
         threadId: "thread-1",
-        senderThreadId: "chief-thread",
+        senderThreadId: "driver-thread",
       }),
     );
 
@@ -535,7 +538,7 @@ describe("autobahn backend", () => {
     expect(card?.workflow).toMatchObject({
       phase: "verify",
       parkedWake: null,
-      nextAction: "Ready for Chief dispatch",
+      nextAction: "Ready for Driver dispatch",
       evidence: [{ label: "Unit tests", path: "report.txt" }],
     });
 
