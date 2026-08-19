@@ -87,6 +87,7 @@ export function rankRoadmapItems<
 const DRIVER_TITLE = "Autobahn Driver";
 const DRIVER_THREAD_KEY = "autobahn-driver-thread-id";
 const WITNESS_FINGERPRINT_KEY = "witness-last-fingerprint";
+const WITNESS_PROBE_TITLE = "Autobahn witness probe";
 const ROADMAP_SNOOZES_KEY = "roadmap-snoozes";
 const CLOSED_DISMISSALS_KEY = "closed-card-dismissals";
 const MAX_SNOOZE_MS = 366 * 24 * 60 * 60 * 1_000;
@@ -2182,6 +2183,67 @@ export default function plugin(bb: BbPluginApi) {
     );
   }
 
+  async function runHiddenWorker(input: {
+    projectId: string;
+    parentThreadId: string;
+    role: string;
+    title: string;
+    prompt: string;
+  }): Promise<string> {
+    const worker = await bb.sdk.threads.spawn({
+      projectId: input.projectId,
+      parentThreadId: input.parentThreadId,
+      environment: { type: "project-default" },
+      prompt: input.prompt,
+      title: input.title,
+      visibility: "hidden",
+    });
+    isolatedChildThreadIds.add(worker.id);
+    workflowStore.appendEvent({
+      threadId: input.parentThreadId,
+      type: "child.spawned",
+      payload: {
+        childThreadId: worker.id,
+        role: input.role,
+        title: input.title,
+      },
+    });
+    try {
+      await bb.sdk.threads.wait({ threadId: worker.id, status: "idle" });
+      const { output } = await bb.sdk.threads.output({ threadId: worker.id });
+      if (!output?.trim()) {
+        throw new Error(`Hidden worker ${worker.id} returned no output.`);
+      }
+      return output;
+    } finally {
+      await bb.sdk.threads.archive({ threadId: worker.id }).catch(() => undefined);
+      await bb.sdk.threads.stop({ threadId: worker.id });
+    }
+  }
+
+  async function runWitnessProbe(input: {
+    projectId: string;
+    threadId: string;
+    findings: string[];
+  }): Promise<string | null> {
+    try {
+      return await runHiddenWorker({
+        projectId: input.projectId,
+        parentThreadId: input.threadId,
+        role: "witness",
+        title: WITNESS_PROBE_TITLE,
+        prompt: [
+          "You are a fresh-context, read-only Autobahn witness probe. Independently confirm the findings below and recommend the single next Driver action. Do not edit files, stop sessions, or bypass human gates.",
+          `Card thread ID: ${input.threadId}`,
+          `Findings:\n${input.findings.map((finding) => `- ${finding}`).join("\n")}`,
+        ].join("\n\n"),
+      });
+    } catch (error) {
+      bb.log.warn(`Autobahn witness probe failed: ${String(error)}`);
+      return null;
+    }
+  }
+
   async function runThreadWitness(threadId: string) {
     if (threadId === driverThreadIdCache) return;
     let thread: Awaited<ReturnType<typeof bb.sdk.threads.get>>;
@@ -2202,8 +2264,19 @@ export default function plugin(bb: BbPluginApi) {
     await bb.storage.kv.set(fingerprintKey, fingerprint);
     if (!findings.length) return;
     bb.log.warn(`Autobahn witness: ${findings.join(" | ")}`);
+    if (!driverThreadIdCache) return;
+    const recommendation = await runWitnessProbe({
+      projectId: thread.projectId,
+      threadId,
+      findings,
+    });
     await notifyDriver(
-      `Autobahn witness found:\n${findings.join("\n")}\nRecommend action; do not stop work automatically.`,
+      [
+        `Autobahn witness found:\n${findings.join("\n")}`,
+        recommendation
+          ? `Witness probe recommendation:\n${recommendation}`
+          : "Recommend action; do not stop work automatically.",
+      ].join("\n"),
     );
   }
 
@@ -3136,6 +3209,7 @@ export default function plugin(bb: BbPluginApi) {
       "Autobahn adversarial plan review",
       "Autobahn verification:",
       "Autobahn validate:",
+      WITNESS_PROBE_TITLE,
     ].some((prefix) => context.thread.title?.startsWith(prefix));
     const isPluginChild =
       context.origin.pluginId === bb.pluginId &&
