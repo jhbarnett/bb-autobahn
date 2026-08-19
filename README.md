@@ -21,7 +21,7 @@ The board uses bb thread sections as coarse ownership state:
 
 A theme-aware corner tick carries the live operational state independently of the lane: idle or queued, agent active, parked, needs human attention, blocked or failed, or complete.
 
-Open combines controller threads with unstarted GitHub issues. Captured work is always front-of-line, regardless of ranking mode. The roadmap is expandable from one to three rows. Individual roadmap issues can be snoozed for one day, three days, one week, or a custom time; they return automatically and the Open header keeps a visible snoozed count.
+Open combines controller threads with unstarted GitHub issues. Captured work is always front-of-line, regardless of ranking mode. The roadmap is expandable from one to three rows. Each roadmap card has a one-click snooze in its bottom-right corner — hover shows the duration, which defaults to 24 hours and is configurable via `snoozeHours`. Snoozed items return automatically and the Open header keeps a visible snoozed count.
 
 Closed is collapsed by default and can be expanded from its lane header. Its broom action clears cards from the Autobahn display only—it never archives threads. Threads archived elsewhere disappear automatically because the board reads only active threads and refreshes on archive events.
 
@@ -78,6 +78,7 @@ The steering-wheel button opens a persistent Driver thread in a right-side panel
 | `contextWarningPercent` | `85` | Context exhaustion warning |
 | `roadmapLimit` | `5` | Maximum unstarted roadmap issues |
 | `roadmapRanking` | `balanced` | `balanced`, `priority`, or `recency` |
+| `snoozeHours` | `24` | One-click roadmap snooze duration (hours) |
 
 Configure values through **Extensions → Plugins → Autobahn** or `bb plugin config autobahn set <key> <value>`.
 

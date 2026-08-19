@@ -169,10 +169,12 @@ describe("autobahn panel", () => {
       slot.getByLabelText("Card state: Needs human attention"),
     ).toBeTruthy();
     expect(slot.getByLabelText("Card state: Idle or queued")).toBeTruthy();
-    fireEvent.click(
-      slot.getByRole("button", { name: "Snooze Top roadmap issue" }),
-    );
-    fireEvent.click(slot.getByRole("button", { name: "1 day" }));
+    const snoozeButton = slot.getByRole("button", {
+      name: "Snooze Top roadmap issue for 1 day",
+    });
+    expect(snoozeButton.getAttribute("title")).toBe("Snooze for 1 day");
+    const beforeSnooze = Date.now();
+    fireEvent.click(snoozeButton);
     await vi.waitFor(() => {
       expect(snoozeRoadmapItem).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -181,6 +183,12 @@ describe("autobahn panel", () => {
         }),
       );
     });
+    const snoozeCall = snoozeRoadmapItem.mock.calls[0]![0] as {
+      wakeAt: number;
+    };
+    const dayMs = 24 * 60 * 60 * 1_000;
+    expect(snoozeCall.wakeAt).toBeGreaterThanOrEqual(beforeSnooze + dayMs);
+    expect(snoozeCall.wakeAt).toBeLessThan(beforeSnooze + dayMs + 60_000);
     expect(slot.queryByText("codex")).toBeNull();
     expect(
       slot.container.querySelector('[data-icon="ChatGPT"]'),
