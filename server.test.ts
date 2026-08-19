@@ -986,6 +986,149 @@ describe("autobahn backend", () => {
     ).resolves.toContain("queue is healthy");
   });
 
+  it("runs witness checks on lifecycle events and auto-clears archived CLOSED cards", async () => {
+    const sections = ["OPEN", "WIP", "R4R", "CLOSED"].map((name) => ({
+      id: `section-${name}`,
+      name,
+      createdAt: 1,
+      updatedAt: 1,
+    }));
+    const failedRow = {
+      id: "thread-err",
+      projectId: "project-1",
+      environmentId: null,
+      providerId: "codex",
+      title: "Failing work",
+      titleFallback: null,
+      sectionId: "section-WIP",
+      status: "error",
+      hasPendingInteraction: false,
+      environmentBranchName: null,
+      updatedAt: Date.now(),
+    };
+    const closedRow = {
+      id: "thread-done",
+      projectId: "project-1",
+      environmentId: null,
+      providerId: "codex",
+      title: "Completed work",
+      titleFallback: null,
+      sectionId: "section-CLOSED",
+      status: "idle",
+      hasPendingInteraction: false,
+      environmentBranchName: null,
+      updatedAt: Date.now(),
+    };
+    let closedArchivedAt: number | null = null;
+    const send = vi.fn(() => ({ ok: true }));
+    const { bb, harness } = createFakePluginHost({
+      pluginId: "autobahn",
+      agentSkillIds: ["autobahn-driver"],
+      sdk: {
+        threadSections: {
+          list: () => sections,
+          create: ({ name }) => ({
+            id: `section-${name}`,
+            name,
+            createdAt: 1,
+            updatedAt: 1,
+          }),
+        },
+        projects: {
+          list: () => [
+            {
+              id: "project-1",
+              name: "Agentbox",
+              kind: "standard",
+              gitRemoteUrl: null,
+              createdAt: 1,
+              updatedAt: 1,
+              sources: [],
+            },
+          ],
+        },
+        threads: {
+          list: () => [failedRow, closedRow],
+          get: ({ threadId }) => {
+            if (threadId === "thread-err") {
+              return { ...failedRow, archivedAt: null, deletedAt: null };
+            }
+            if (threadId === "thread-done") {
+              return {
+                ...closedRow,
+                archivedAt: closedArchivedAt,
+                deletedAt: null,
+              };
+            }
+            return {
+              id: threadId,
+              projectId: "project-1",
+              archivedAt: null,
+              deletedAt: null,
+            };
+          },
+          spawn: () => ({ id: "driver-thread" }),
+          send,
+          defaultExecutionOptions: async () => ({
+            model: "gpt-5.6",
+            reasoningLevel: "high",
+            permissionMode: "auto",
+            serviceTier: "default",
+            source: "client/turn/start",
+          }),
+          timeline: async () => ({ rows: [] }),
+          output: async () => ({ output: "Working." }),
+        },
+      },
+    });
+    plugin(bb);
+
+    await expect(
+      harness.behavior.callRpc("getDriver"),
+    ).resolves.toEqual({ threadId: "driver-thread" });
+
+    await harness.behavior.emitThreadEvent("thread.failed", {
+      thread: makeThreadResponse({ id: "thread-err" }),
+    });
+    expect(send).toHaveBeenCalledTimes(1);
+    const notification = send.mock.calls[0]![0] as {
+      threadId: string;
+      input: Array<{ text: string }>;
+    };
+    expect(notification.threadId).toBe("driver-thread");
+    expect(notification.input[0]!.text).toContain(
+      "thread-err: runtime is in error",
+    );
+    expect(notification.input[0]!.text).not.toContain("thread-done");
+
+    await harness.behavior.emitThreadEvent("thread.idle", {
+      thread: makeThreadResponse({ id: "thread-err" }),
+    });
+    expect(send).toHaveBeenCalledTimes(1);
+
+    const before = await harness.behavior.callRpc("listBoard", {});
+    expect(
+      before.lanes
+        .find((lane) => lane.status === "CLOSED")
+        ?.cards.map((card) => card.id),
+    ).toEqual(["thread-done"]);
+    closedArchivedAt = Date.now();
+    await harness.behavior.emitThreadEvent("thread.archived", {
+      thread: makeThreadResponse({ id: "thread-done" }),
+    });
+    expect(
+      harness.inspection.realtimeSignals.some(
+        (signal) =>
+          signal.channel === "board-changed" &&
+          (signal.payload as { event?: string }).event === "closed.auto-cleared",
+      ),
+    ).toBe(true);
+    const after = await harness.behavior.callRpc("listBoard", {});
+    expect(
+      after.lanes.find((lane) => lane.status === "CLOSED")?.cards,
+    ).toHaveLength(0);
+  });
+
   it("selects only skill ids shipped by the manifest's skills directory", async () => {
     const skillsRoot = join(
       dirname(fileURLToPath(import.meta.url)),

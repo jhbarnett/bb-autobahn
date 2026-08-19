@@ -2182,6 +2182,31 @@ export default function plugin(bb: BbPluginApi) {
     );
   }
 
+  async function runThreadWitness(threadId: string) {
+    if (threadId === driverThreadIdCache) return;
+    let thread: Awaited<ReturnType<typeof bb.sdk.threads.get>>;
+    try {
+      thread = await bb.sdk.threads.get({ threadId });
+    } catch {
+      return;
+    }
+    if (thread.archivedAt || thread.deletedAt) return;
+    const findings = (await witnessFindings(thread.projectId)).filter(
+      (finding) => finding.startsWith(`${threadId}: `),
+    );
+    const fingerprintKey = `${WITNESS_FINGERPRINT_KEY}:${threadId}`;
+    const fingerprint = JSON.stringify(findings);
+    const previous =
+      (await bb.storage.kv.get<string>(fingerprintKey)) ?? "";
+    if (fingerprint === previous) return;
+    await bb.storage.kv.set(fingerprintKey, fingerprint);
+    if (!findings.length) return;
+    bb.log.warn(`Autobahn witness: ${findings.join(" | ")}`);
+    await notifyDriver(
+      `Autobahn witness found:\n${findings.join("\n")}\nRecommend action; do not stop work automatically.`,
+    );
+  }
+
   async function clearStatusOverride(threadId: string, reason: string) {
     workflowStore.upsert(threadId, {
       statusOverride: null,
@@ -3181,6 +3206,33 @@ export default function plugin(bb: BbPluginApi) {
       }
     });
   }
+
+  // Event-driven updates; the cron schedules below stay as low-frequency
+  // backstops for missed events and external (GitHub) state.
+  for (const event of ["thread.idle", "thread.failed"] as const) {
+    bb.events.on(event, async ({ thread }) => {
+      await runThreadWitness(thread.id);
+    });
+  }
+
+  bb.events.on("thread.archived", async ({ thread }) => {
+    const sections = await ensureSections();
+    let archived: Awaited<ReturnType<typeof bb.sdk.threads.get>>;
+    try {
+      archived = await bb.sdk.threads.get({ threadId: thread.id });
+    } catch {
+      return;
+    }
+    if (!archived.archivedAt || archived.sectionId !== sections.CLOSED) return;
+    const dismissals = await readClosedDismissals();
+    if (dismissals.has(archived.id)) return;
+    dismissals.add(archived.id);
+    await bb.storage.kv.set(CLOSED_DISMISSALS_KEY, [...dismissals]);
+    bb.realtime.publish("board-changed", {
+      threadId: archived.id,
+      event: "closed.auto-cleared",
+    });
+  });
 
   bb.background.schedule("wake-cards", "* * * * *", async () => {
     await wakeReadyCards();
