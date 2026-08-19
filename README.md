@@ -1,6 +1,6 @@
 # Autobahn
 
-Autobahn is an opinionated, automated Kanban flywheel for [bb](https://github.com/get-bb/bb). Work is pulled, not pushed: captured items queue on the Open roadmap, ready work dispatches into WIP as capacity frees, finished builds roll into fresh-context verification, verified work stops for exactly one human decision, and what closes feeds the next round of capture. Each visible card is a stable controller thread; fresh hidden agents perform bounded planning and verification passes in isolated worktrees.
+Autobahn is an opinionated, automated Kanban flywheel for [bb](https://github.com/get-bb/bb). Work is pulled, not pushed: captured items queue on the Open roadmap, the Driver dispatches ready work into WIP as capacity frees, finished builds roll into fresh-context verification, verified work stops for exactly one human decision, and what closes feeds the next round of capture. Each visible card is a stable controller thread; fresh hidden agents perform bounded planning and verification passes in isolated worktrees.
 
 Policy is a feature, not the foundation. Gates, WIP limits, plan contracts, and typed exits are tunable guardrails that keep the flywheel honest — the automation is what keeps it spinning.
 
