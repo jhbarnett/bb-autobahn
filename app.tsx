@@ -2,11 +2,16 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ThreadChat,
   definePluginApp,
+  experimental_useSidebarThreadActions,
+  experimental_useSidebarThreads,
   useBbNavigate,
   useRealtime,
   useRealtimeConnectionState,
   useRpc,
+  useSettings,
   type PluginPendingInteractionProps,
+  type PluginSidebarThread,
+  type PluginThreadListProps,
 } from "@get-bb/plugin-sdk/app";
 import { toast } from "sonner";
 import type { BoardResult, rpcContract } from "./server";
@@ -1269,6 +1274,278 @@ function DriverPanel() {
   );
 }
 
+const SIDEBAR_LANE_ORDER: BoardStatus[] = ["WIP", "R4R", "OPEN", "CLOSED"];
+
+function threadTitle(thread: PluginSidebarThread) {
+  return thread.title ?? thread.titleFallback ?? thread.id;
+}
+
+function threadAgentCount(thread: PluginSidebarThread | undefined) {
+  if (!thread) return 0;
+  const { workflows, backgroundAgents, backgroundCommands, planMode, goals } =
+    thread.activity;
+  return workflows + backgroundAgents + backgroundCommands + planMode + goals;
+}
+
+function SidebarThreadRow({
+  threadId,
+  title,
+  active,
+  attention,
+  agentCount,
+  indicatorLabel,
+  onOpen,
+}: {
+  threadId: string;
+  title: string;
+  active: boolean;
+  attention: readonly string[];
+  agentCount: number;
+  indicatorLabel: string | null;
+  onOpen: (threadId: string) => void;
+}) {
+  return (
+    <button
+      type="button"
+      data-sidebar-thread-shortcut-target=""
+      data-sidebar-thread-id={threadId}
+      aria-current={active ? "true" : undefined}
+      onClick={() => onOpen(threadId)}
+      className={cn(
+        "flex w-full min-w-0 items-center gap-1.5 rounded-md px-2 py-1.5 text-left hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+        active && "bg-accent",
+      )}
+    >
+      <span
+        className="min-w-0 flex-1 truncate text-xs text-foreground"
+        title={title}
+      >
+        {title}
+      </span>
+      {agentCount > 0 ? (
+        <span
+          className="shrink-0 rounded bg-primary/10 px-1 text-[9px] font-semibold tabular-nums text-primary"
+          title={`${agentCount} running agents`}
+          aria-label={`${agentCount} running agents`}
+        >
+          {agentCount}
+        </span>
+      ) : null}
+      {attention.map((gate) => (
+        <WorkflowGateBadge
+          key={gate}
+          gate={gate as WorkflowAttentionSummary["gate"]}
+          className="shrink-0"
+        />
+      ))}
+      {indicatorLabel ? (
+        <span
+          role="img"
+          aria-label={indicatorLabel}
+          title={indicatorLabel}
+          className="size-1.5 shrink-0 rounded-full bg-primary"
+        />
+      ) : null}
+    </button>
+  );
+}
+
+function BoardSidebarThreadList({
+  activeThreadId,
+  onNavigate,
+  searchQuery,
+}: PluginThreadListProps) {
+  const settings = useSettings();
+  const rpc = useRpc<typeof rpcContract>();
+  const sidebar = experimental_useSidebarThreads();
+  const actions = experimental_useSidebarThreadActions();
+  const [board, setBoard] = useState<BoardResult | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const mounted = useRef(true);
+  const enabled = settings.values?.boardSidebar === true;
+
+  const loadBoard = useCallback(async () => {
+    try {
+      const next = await rpc.call("listBoard", {});
+      if (!mounted.current) return;
+      setBoard(next);
+      setError(null);
+    } catch (caught) {
+      if (!mounted.current) return;
+      setError(
+        caught instanceof Error ? caught.message : "Could not load board",
+      );
+    }
+  }, [rpc]);
+
+  useEffect(() => {
+    mounted.current = true;
+    if (enabled) void loadBoard();
+    return () => {
+      mounted.current = false;
+    };
+  }, [enabled, loadBoard]);
+
+  useRealtime("board-changed", () => {
+    if (enabled) void loadBoard();
+  });
+
+  const openThread = useCallback(
+    (threadId: string) => {
+      actions.open(threadId);
+      onNavigate();
+    },
+    [actions, onNavigate],
+  );
+
+  const threadsById = useMemo(() => {
+    const result = new Map<string, PluginSidebarThread>();
+    for (const thread of sidebar.threads) result.set(thread.id, thread);
+    return result;
+  }, [sidebar.threads]);
+
+  const query = searchQuery.trim().toLowerCase();
+  const matches = useCallback(
+    (title: string) => !query || title.toLowerCase().includes(query),
+    [query],
+  );
+
+  const lanes = useMemo(() => {
+    const byStatus = new Map(
+      (board?.lanes ?? []).map((lane) => [lane.status, lane] as const),
+    );
+    return SIDEBAR_LANE_ORDER.flatMap((status) => {
+      const lane = byStatus.get(status);
+      return lane ? [lane] : [];
+    });
+  }, [board]);
+
+  const boardThreadIds = useMemo(
+    () => new Set(lanes.flatMap((lane) => lane.cards.map((card) => card.id))),
+    [lanes],
+  );
+
+  const needsYouCards = useMemo(
+    () =>
+      lanes
+        .flatMap((lane) => lane.cards)
+        .filter((card) => card.attention.length > 0 && matches(card.title)),
+    [lanes, matches],
+  );
+
+  const otherThreads = useMemo(
+    () =>
+      sidebar.threads
+        .filter(
+          (thread) =>
+            !thread.isArchived &&
+            !boardThreadIds.has(thread.id) &&
+            matches(threadTitle(thread)),
+        )
+        .sort((a, b) => b.updatedAt - a.updatedAt),
+    [boardThreadIds, matches, sidebar.threads],
+  );
+
+  // Rendered while the host is still resolving settings; the host keeps its
+  // own chrome, so a momentarily empty scroll area is fine.
+  if (settings.isLoading) return null;
+  if (!enabled) {
+    // The slot registration is static (setup runs without settings), so the
+    // plugin-level gate lives here: throwing makes bb fall back to its
+    // built-in thread list instead of leaving the sidebar empty.
+    throw new Error(
+      'The Autobahn board sidebar is turned off. Enable the "Board sidebar" setting in the Autobahn plugin, or pick another sidebar under Settings → Appearance.',
+    );
+  }
+
+  return (
+    <nav aria-label="Autobahn board sidebar" className="space-y-3 p-2">
+      {error ? (
+        <p className="rounded border border-destructive/40 bg-destructive/10 px-2 py-1 text-[10px] text-destructive">
+          Board refresh failed: {error}
+        </p>
+      ) : null}
+      {needsYouCards.length > 0 ? (
+        <section aria-label="Needs you">
+          <h2 className="px-2 pb-1 text-[10px] font-bold tracking-[0.16em] text-[var(--attention)]">
+            NEEDS YOU · {needsYouCards.length}
+          </h2>
+          {needsYouCards.map((card) => (
+            <SidebarThreadRow
+              key={`needs-you-${card.id}`}
+              threadId={card.id}
+              title={card.title}
+              active={card.id === activeThreadId}
+              attention={card.attention}
+              agentCount={threadAgentCount(threadsById.get(card.id))}
+              indicatorLabel={null}
+              onOpen={openThread}
+            />
+          ))}
+        </section>
+      ) : null}
+      {lanes.map((lane) => {
+        const cards = lane.cards.filter((card) => matches(card.title));
+        if (query && cards.length === 0) return null;
+        const agentCount = lane.cards.reduce(
+          (total, card) => total + threadAgentCount(threadsById.get(card.id)),
+          0,
+        );
+        return (
+          <section key={lane.status} aria-label={STATUS_LABELS[lane.status]}>
+            <h2 className="flex items-center gap-1.5 px-2 pb-1 text-[10px] font-bold tracking-[0.16em] text-muted-foreground">
+              {lane.status}
+              <span className="font-normal tabular-nums">
+                {lane.capacityCount}
+                {lane.softLimit ? `/${lane.softLimit}` : ""}
+              </span>
+              {agentCount > 0 ? (
+                <span className="ml-auto font-normal">
+                  {agentCount} agents
+                </span>
+              ) : null}
+            </h2>
+            {cards.map((card) => (
+              <SidebarThreadRow
+                key={card.id}
+                threadId={card.id}
+                title={card.title}
+                active={card.id === activeThreadId}
+                attention={card.attention}
+                agentCount={threadAgentCount(threadsById.get(card.id))}
+                indicatorLabel={threadsById.get(card.id)?.indicatorLabel ?? null}
+                onOpen={openThread}
+              />
+            ))}
+            {cards.length === 0 ? (
+              <p className="px-2 text-[10px] text-muted-foreground">Empty</p>
+            ) : null}
+          </section>
+        );
+      })}
+      {otherThreads.length > 0 ? (
+        <section aria-label="Other threads">
+          <h2 className="px-2 pb-1 text-[10px] font-bold tracking-[0.16em] text-muted-foreground">
+            OTHER THREADS
+          </h2>
+          {otherThreads.map((thread) => (
+            <SidebarThreadRow
+              key={thread.id}
+              threadId={thread.id}
+              title={threadTitle(thread)}
+              active={thread.id === activeThreadId}
+              attention={[]}
+              agentCount={threadAgentCount(thread)}
+              indicatorLabel={thread.indicatorLabel}
+              onOpen={openThread}
+            />
+          ))}
+        </section>
+      ) : null}
+    </nav>
+  );
+}
+
 export default definePluginApp((app) => {
   app.slots.pendingInteraction({
     id: "plan-approval",
@@ -1281,6 +1558,13 @@ export default definePluginApp((app) => {
   app.slots.pendingInteraction({
     id: "gate-decision",
     component: GateDecisionInteraction,
+  });
+  app.slots.experimental_threadList({
+    id: "autobahn-board-sidebar",
+    title: "Autobahn board",
+    description:
+      'Board lanes with attention chips instead of the flat thread list. Requires the Autobahn "Board sidebar" setting.',
+    component: BoardSidebarThreadList,
   });
   app.slots.navPanel({
     id: "autobahn-board",

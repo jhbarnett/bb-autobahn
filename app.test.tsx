@@ -5,6 +5,7 @@ import {
   loadPluginApp,
   renderSlot,
 } from "@get-bb/plugin-sdk/testing/app";
+import type { PluginSidebarThread } from "@get-bb/plugin-sdk/app";
 import type { BoardResult } from "./server";
 
 const board: BoardResult = {
@@ -506,5 +507,172 @@ describe("autobahn panel", () => {
       });
     });
     interaction.lifecycle.unmount();
+  });
+});
+
+function makeSidebarThread(
+  overrides: Partial<PluginSidebarThread> & { id: string },
+): PluginSidebarThread {
+  return {
+    projectId: "project-1",
+    title: null,
+    titleFallback: null,
+    parentThreadId: null,
+    sectionId: null,
+    originKind: null,
+    originPluginId: null,
+    providerId: "claude-code",
+    hasPendingInteraction: false,
+    activity: {
+      workflows: 0,
+      backgroundAgents: 0,
+      backgroundCommands: 0,
+      planMode: 0,
+      goals: 0,
+    },
+    indicator: "none",
+    indicatorLabel: null,
+    isUnread: false,
+    isPinned: false,
+    isArchived: false,
+    environment: null,
+    host: null,
+    createdAt: 1,
+    updatedAt: 1,
+    lastReadAt: null,
+    latestAttentionAt: 0,
+    ...overrides,
+  };
+}
+
+describe("autobahn board sidebar", () => {
+  const sidebarProps = {
+    activeThreadId: null as string | null,
+    activeProjectId: null as string | null,
+    isCompactViewport: false,
+    onNavigate: () => undefined,
+    searchQuery: "",
+  };
+
+  it("registers the thread list replacement slot", async () => {
+    const app = await loadPluginApp(() => import("./app"));
+    expect(app.threadLists.map((registration) => registration.id)).toEqual([
+      "autobahn-board-sidebar",
+    ]);
+  });
+
+  it("renders board lanes with the sidebar DOM contract and opens threads", async () => {
+    const onNavigate = vi.fn();
+    const app = await loadPluginApp(() => import("./app"));
+    const slot = renderSlot(
+      app.threadLists[0]!,
+      { ...sidebarProps, activeThreadId: "thread-1", onNavigate },
+      {
+        settings: { boardSidebar: true },
+        rpc: { listBoard: () => board },
+        sidebarThreads: {
+          status: "ready",
+          threads: [
+            makeSidebarThread({
+              id: "thread-1",
+              title: "Ship feature",
+              activity: {
+                workflows: 1,
+                backgroundAgents: 1,
+                backgroundCommands: 0,
+                planMode: 0,
+                goals: 0,
+              },
+            }),
+            makeSidebarThread({
+              id: "thread-2",
+              title: "Off-board exploration",
+              indicator: "waiting-for-input",
+              indicatorLabel: "Thread needs user input",
+              updatedAt: 5,
+            }),
+          ],
+        },
+      },
+    );
+
+    // Wait for the board load; until it lands, cards sit under Other threads.
+    await slot.findByRole("heading", { name: "NEEDS YOU · 1" });
+    // The attention card renders in both the Needs-you rail and its lane.
+    const rows = slot.getAllByRole("button", { name: /Ship feature/ });
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      expect(row.getAttribute("data-sidebar-thread-id")).toBe("thread-1");
+      expect(row.hasAttribute("data-sidebar-thread-shortcut-target")).toBe(
+        true,
+      );
+      expect(row.getAttribute("aria-current")).toBe("true");
+    }
+    const row = rows[0]!;
+    expect(slot.getByRole("heading", { name: "NEEDS YOU · 1" })).toBeTruthy();
+    expect(
+      slot.getByRole("heading", { name: /WIP.*1\/3.*2 agents/ }),
+    ).toBeTruthy();
+    expect(slot.getByRole("heading", { name: /R4R.*0\/6/ })).toBeTruthy();
+    expect(slot.getByRole("heading", { name: "OTHER THREADS" })).toBeTruthy();
+    expect(
+      slot.getAllByLabelText("Attention: Review requested").length,
+    ).toBeGreaterThan(0);
+    expect(slot.getAllByLabelText("2 running agents").length).toBeGreaterThan(0);
+    const other = slot.getByRole("button", { name: /Off-board exploration/ });
+    expect(other.getAttribute("data-sidebar-thread-id")).toBe("thread-2");
+    expect(slot.getByLabelText("Thread needs user input")).toBeTruthy();
+
+    fireEvent.click(row);
+    expect(slot.inspection.sidebarActionCalls).toContainEqual({
+      method: "open",
+      threadId: "thread-1",
+    });
+    expect(onNavigate).toHaveBeenCalledTimes(1);
+    slot.lifecycle.unmount();
+  });
+
+  it("filters lanes and other threads by the host search query", async () => {
+    const app = await loadPluginApp(() => import("./app"));
+    const slot = renderSlot(
+      app.threadLists[0]!,
+      { ...sidebarProps, searchQuery: "ship" },
+      {
+        settings: { boardSidebar: true },
+        rpc: { listBoard: () => board },
+        sidebarThreads: {
+          status: "ready",
+          threads: [
+            makeSidebarThread({ id: "thread-2", title: "Off-board exploration" }),
+          ],
+        },
+      },
+    );
+
+    expect(
+      (await slot.findAllByRole("button", { name: /Ship feature/ })).length,
+    ).toBeGreaterThan(0);
+    expect(
+      slot.queryByRole("button", { name: /Off-board exploration/ }),
+    ).toBeNull();
+    expect(slot.queryByRole("heading", { name: /OPEN/ })).toBeNull();
+    slot.lifecycle.unmount();
+  });
+
+  it("throws when the Board sidebar setting is off so bb falls back", async () => {
+    const app = await loadPluginApp(() => import("./app"));
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    try {
+      expect(() =>
+        renderSlot(app.threadLists[0]!, sidebarProps, {
+          settings: { boardSidebar: false },
+          rpc: { listBoard: () => board },
+        }),
+      ).toThrowError(/Board sidebar/);
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 });

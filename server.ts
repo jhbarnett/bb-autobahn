@@ -626,6 +626,13 @@ export default function plugin(bb: BbPluginApi) {
       label: "Roadmap ranking (balanced | priority | recency)",
       default: "balanced",
     },
+    boardSidebar: {
+      type: "boolean",
+      label: "Board sidebar",
+      description:
+        "Offer the Autobahn board as a sidebar thread list replacement (picked under Settings → Appearance → Sidebar). Off by default.",
+      default: false,
+    },
   });
 
   const childAdapter: ChildSessionAdapter = {
