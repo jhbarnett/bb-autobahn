@@ -46,7 +46,7 @@
     "typescript": "7.0.2",
     "vitest": "4.1.11",
     "yaml": "2.9.0",
-    "bb-app": "0.38.0"
+    "bb-app": "0.39.0"
   },
   "scripts": {
     "build": "bb plugin build",
